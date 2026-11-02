@@ -4,9 +4,9 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
-from gxyfi import db, market
+from gxyfi import db, dca, market
 from gxyfi.export_excel import export_workbook
 
 
@@ -149,13 +149,66 @@ class CoreTest(unittest.TestCase):
         db.delete_account(account)
         self.assertEqual(db.list_balances(account), [])
 
+    def test_dca(self):
+        plan = db.save_dca_plan(
+            {
+                "name": "沪深300",
+                "symbol": "20",
+                "amount": 500,
+                "cycle": "每月",
+                "debit_day": 8,
+                "status": "进行中",
+                "started_on": "2024-01-08",
+                "manual_nav": None,
+                "note": "",
+            }
+        )
+        self.assertEqual(db.list_dca_plans()[0]["symbol"], "000020")
+        db.save_dca_record(
+            {"plan_id": plan, "kind": "期初", "trade_date": "2026-01-01", "amount": 100, "shares": 100, "nav": 1, "note": ""}
+        )
+        db.save_dca_record(
+            {"plan_id": plan, "kind": "定投", "trade_date": "2026-02-08", "amount": 200, "nav": 2, "shares": None, "note": ""}
+        )
+        rows, total, unpriced = db.dca_plan_rows()
+        self.assertEqual(rows[0]["shares"], 200)
+        self.assertEqual(rows[0]["cost"], 300)
+        self.assertEqual(rows[0]["market_value"], 400)
+        self.assertEqual(total, 400)
+        self.assertEqual(unpriced, 0)
+        db.save_dca_record(
+            {"plan_id": plan, "kind": "赎回", "trade_date": "2026-03-01", "amount": 160, "shares": 100, "nav": 1.6, "note": ""}
+        )
+        db.save_dca_record(
+            {"plan_id": plan, "kind": "红利再投", "trade_date": "2026-03-15", "amount": 10, "shares": 10, "nav": 1.5, "note": ""}
+        )
+        rows, total, _unpriced = db.dca_plan_rows()
+        self.assertEqual(rows[0]["shares"], 110)
+        self.assertEqual(rows[0]["cost"], 150)
+        self.assertEqual(total, 165)
+        with self.assertRaises(ValueError):
+            db.save_dca_record(
+                {"plan_id": plan, "kind": "赎回", "trade_date": "2026-04-01", "amount": 1, "shares": 500, "note": ""}
+            )
+        path = Path(self.tmp.name) / "hist.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.append(dca.TEMPLATE_HEADERS)
+        sheet.append(["2026-04-08", "定投", 100, 2, None, 0, "四月"])
+        book.save(path)
+        self.assertEqual(db.import_dca_records(plan, path), 1)
+        rows, total, _unpriced = db.dca_plan_rows()
+        self.assertEqual(rows[0]["shares"], 160)
+        self.assertEqual(rows[0]["cost"], 250)
+        self.assertEqual(db.portfolio_summary(date(2026, 10, 30))["invest_cny"], total)
+
     def test_excel(self):
         path = Path(self.tmp.name) / "out.xlsx"
         export_workbook(path)
         wb = load_workbook(path)
         self.assertEqual(
             wb.sheetnames,
-            ["总览", "汇率", "账户", "余额快照", "投资持仓", "不动产", "支出", "预算", "行情"],
+            ["总览", "汇率", "账户", "余额快照", "账户明细", "投资持仓", "基金定投", "定投记录", "不动产", "支出", "预算", "行情"],
         )
         self.assertEqual(wb["总览"]["A2"].value, "储蓄")
         self.assertEqual(wb["总览"]["B2"].value, 0)

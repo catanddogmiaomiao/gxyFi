@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from gxyfi.dca import CYCLES, STATUSES, WEEKDAYS
 from gxyfi.db import ACCOUNT_KINDS, CURRENCIES, PROPERTY_KINDS
 
 
@@ -416,4 +417,154 @@ def edit_fx(parent, fx):
         "HKD": hkd.property("parsed"),
         "token": token.text().strip(),
         "clear_token": clear_token.isChecked(),
+    }
+
+
+def edit_dca_plan(parent, initial=None):
+    initial = initial or {}
+    name = _line(initial.get("name", ""), "例如 沪深300ETF联接")
+    symbol = _line(initial.get("symbol", ""), "6 位基金代码")
+    amount = _line("" if initial.get("amount") is None else initial.get("amount"), "每期扣款金额")
+    cycle = _combo([(item, item) for item in CYCLES], initial.get("cycle", "每月"))
+    day = QComboBox()
+    status = _combo([(item, item) for item in STATUSES], initial.get("status", "进行中"))
+    started = _line(initial.get("started_on") or "", "YYYY-MM-DD，可留空")
+    manual = _line("" if initial.get("manual_nav") is None else initial.get("manual_nav"), "留空则用最近一次确认净值")
+    note = _line(initial.get("note", ""))
+
+    def refill_days():
+        previous = day.currentData()
+        day.blockSignals(True)
+        day.clear()
+        if cycle.currentData() == "每月":
+            for number in range(1, 29):
+                day.addItem(f"{number} 日", number)
+            target = previous if isinstance(previous, int) and 1 <= previous <= 28 else int(initial.get("debit_day") or 8)
+        else:
+            for number in range(1, 6):
+                day.addItem(WEEKDAYS[number], number)
+            fallback = int(initial.get("debit_day") or 1)
+            target = previous if isinstance(previous, int) and 1 <= previous <= 5 else min(fallback, 5)
+        index = day.findData(target)
+        day.setCurrentIndex(0 if index < 0 else index)
+        day.blockSignals(False)
+
+    cycle.currentIndexChanged.connect(lambda *_: refill_days())
+    refill_days()
+    rows = [
+        ("基金名称", name),
+        ("基金代码", symbol),
+        ("每期金额", amount),
+        ("扣款周期", cycle),
+        ("扣款日", day),
+        ("状态", status),
+        ("开始日期", started),
+        ("最新净值", manual),
+        ("备注", note),
+    ]
+
+    def validate():
+        if not name.text().strip():
+            return "请填写基金名称"
+        paid, error = _parse_number(amount.text(), "每期金额", required=True, allow_zero=False)
+        if error:
+            return error
+        started_on, error = _parse_optional_date(started.text(), "开始日期")
+        if error:
+            return error
+        nav, error = _parse_number(manual.text(), "最新净值")
+        if error:
+            return error
+        if nav is not None and nav <= 0:
+            return "最新净值需要大于 0"
+        amount.setProperty("parsed", paid)
+        started.setProperty("parsed", started_on)
+        manual.setProperty("parsed", nav)
+        return None
+
+    if not run_form(parent, "定投计划", rows, validate):
+        return None
+    return {
+        "name": name.text().strip(),
+        "symbol": symbol.text().strip(),
+        "amount": amount.property("parsed"),
+        "cycle": cycle.currentData(),
+        "debit_day": day.currentData(),
+        "status": status.currentData(),
+        "started_on": started.property("parsed"),
+        "manual_nav": manual.property("parsed"),
+        "note": note.text().strip(),
+    }
+
+
+def edit_dca_record(parent, initial=None):
+    initial = initial or {}
+    kinds = [("期初", "期初"), ("定投", "定投"), ("赎回", "赎回"), ("红利再投", "红利再投")]
+    kind = _combo(kinds, initial.get("kind", "定投"))
+    trade_date = _date_edit(initial.get("trade_date"))
+    amount = _line("" if initial.get("amount") in (None, "") else initial.get("amount"))
+    nav = _line("" if initial.get("nav") is None else initial.get("nav"))
+    shares = _line("" if initial.get("shares") in (None, "") else initial.get("shares"))
+    fee = _line("" if initial.get("fee") in (None, "") else initial.get("fee"), "没有就留空")
+    note = _line(initial.get("note", ""))
+    hint = QLabel("")
+    hint.setWordWrap(True)
+    hint.setObjectName("PageSub")
+
+    def sync_kind():
+        current = kind.currentData()
+        hints = {
+            "期初": "期初只记当前份额和总成本。之后的明细不要再把这段份额导入一遍。",
+            "定投": "扣款金额按实际扣款填写。确认份额可留空，按（扣款金额 − 手续费）/ 确认净值计算。",
+            "赎回": "赎回按份额减少持仓，成本按当时的平均成本等比例扣减。到账金额只留作记录。",
+            "红利再投": "红利再投增加份额，不增加成本。",
+        }
+        amount.setPlaceholderText(
+            {"期初": "总成本", "定投": "扣款金额", "赎回": "到账金额，可留空", "红利再投": "红利金额，可留空"}[current]
+        )
+        shares.setPlaceholderText("定投可留空，其余需要填写" if current == "定投" else "确认份额")
+        hint.setText(hints[current])
+
+    kind.currentIndexChanged.connect(lambda *_: sync_kind())
+    sync_kind()
+    rows = [
+        ("类型", kind),
+        ("确认日期", trade_date),
+        ("金额", amount),
+        ("确认净值", nav),
+        ("确认份额", shares),
+        ("手续费", fee),
+        ("备注", note),
+        ("", hint),
+    ]
+
+    def validate():
+        paid, error = _parse_number(amount.text(), "金额")
+        if error:
+            return error
+        price, error = _parse_number(nav.text(), "确认净值")
+        if error:
+            return error
+        quantity, error = _parse_number(shares.text(), "确认份额")
+        if error:
+            return error
+        charge, error = _parse_number(fee.text(), "手续费")
+        if error:
+            return error
+        amount.setProperty("parsed", paid)
+        nav.setProperty("parsed", price)
+        shares.setProperty("parsed", quantity)
+        fee.setProperty("parsed", charge)
+        return None
+
+    if not run_form(parent, "定投确认", rows, validate):
+        return None
+    return {
+        "kind": kind.currentData(),
+        "trade_date": trade_date.date().toString("yyyy-MM-dd"),
+        "amount": amount.property("parsed"),
+        "nav": nav.property("parsed"),
+        "shares": shares.property("parsed"),
+        "fee": fee.property("parsed"),
+        "note": note.text().strip(),
     }

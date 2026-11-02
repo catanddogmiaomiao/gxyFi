@@ -183,4 +183,67 @@ QToolTip {
 QSplitter::handle {
     background: #2A2418;
 }
+#DialogTitle {
+    color: #F4E7C6;
+    font-size: 18px;
+    font-family: "Palatino Linotype", "Microsoft YaHei UI";
+}
+#Warn {
+    color: #C4786A;
+    font-size: 12px;
+}
+#Good {
+    color: #7F9E93;
+    font-size: 12px;
+}
+#Figure {
+    color: #E4C98A;
+    font-size: 13px;
+}
+QTabWidget::pane {
+    border: none;
+    border-top: 1px solid #2C261C;
+    top: -1px;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #8C877C;
+    padding: 8px 18px;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:selected {
+    color: #F4E7C6;
+    border-bottom: 2px solid #C6A15B;
+}
+QTabBar::tab:hover {
+    color: #E7E1D6;
+}
+QCheckBox {
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #5C5344;
+    border-radius: 3px;
+    background: #10151C;
+}
+QCheckBox::indicator:checked {
+    background: #C6A15B;
+    border-color: #C6A15B;
+}
+QListWidget {
+    background: #12171F;
+    border: 1px solid #2C261C;
+    border-radius: 8px;
+    padding: 4px;
+}
+QListWidget::item {
+    padding: 6px 4px;
+}
+QListWidget::item:selected {
+    background: #2A2418;
+    color: #F4E7C6;
+}
 """

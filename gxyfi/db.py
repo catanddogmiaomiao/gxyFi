@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
+
+from gxyfi import dca, statement
 
 ACCOUNT_KINDS = ["现金", "活期", "定期", "货币基金", "公积金", "其他"]
 PROPERTY_KINDS = ["住宅", "商铺", "车位", "土地", "其他"]
@@ -103,7 +106,72 @@ CREATE TABLE IF NOT EXISTS budget_lines (
     note TEXT NOT NULL DEFAULT '',
     UNIQUE (year, category_id)
 );
+CREATE TABLE IF NOT EXISTS dca_plans (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    amount REAL NOT NULL,
+    cycle TEXT NOT NULL DEFAULT '每月',
+    debit_day INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT '进行中',
+    started_on TEXT,
+    manual_nav REAL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dca_records (
+    id INTEGER PRIMARY KEY,
+    plan_id INTEGER NOT NULL REFERENCES dca_plans(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    nav REAL,
+    shares REAL NOT NULL DEFAULT 0,
+    fee REAL NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_txns (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    txn_date TEXT NOT NULL,
+    txn_time TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL,
+    balance REAL,
+    counterparty TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    batch TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (account_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS account_txns_by_account ON account_txns(account_id, txn_date);
+CREATE TABLE IF NOT EXISTS txn_rules (
+    id INTEGER PRIMARY KEY,
+    field TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    treat TEXT NOT NULL,
+    category_id INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE (field, keyword)
+);
 """
+
+ADDED_COLUMNS = (
+    ("accounts", "import_map", "TEXT NOT NULL DEFAULT ''"),
+    ("balance_entries", "source", "TEXT NOT NULL DEFAULT '手工'"),
+    ("account_txns", "treat", "TEXT NOT NULL DEFAULT ''"),
+    ("account_txns", "category_id", "INTEGER"),
+    ("expenses", "txn_id", "INTEGER"),
+    ("expenses", "source", "TEXT NOT NULL DEFAULT '手工'"),
+)
+TXN_COLUMNS = (
+    "id", "account_id", "txn_date", "txn_time", "amount", "balance", "counterparty",
+    "summary", "note", "fingerprint", "batch", "treat", "category_id", "created_at", "updated_at",
+)
+TREATS = ("", "支出", "退款", "不计", "转账")
 
 
 def db_path() -> Path:
@@ -158,6 +226,10 @@ def _one(sql, args=()):
 def init_db():
     with connect() as conn:
         conn.executescript(SCHEMA)
+        for table, column, spec in ADDED_COLUMNS:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
         count = conn.execute("SELECT COUNT(*) AS n FROM expense_categories").fetchone()["n"]
         if count == 0:
             conn.executemany(
@@ -173,6 +245,93 @@ def init_db():
 
 def _fx_blank():
     return {"rate": None, "source": "未设置", "at": ""}
+
+
+def _remote():
+    from gxyfi import cloud
+
+    return cloud if cloud.enabled() else None
+
+
+CLOUD_TABLES = (
+    ("accounts", "accounts"),
+    ("balance_entries", "balances"),
+    ("holdings", "holdings"),
+    ("quotes", "quotes"),
+    ("properties", "properties"),
+    ("expense_categories", "categories"),
+    ("expenses", "expenses"),
+    ("budget_lines", "budgets"),
+    ("dca_plans", "dcaPlans"),
+    ("dca_records", "dcaRecords"),
+    ("txn_rules", "txnRules"),
+)
+
+
+def replace_from_cloud(state):
+    """用网站返回的整本账覆盖本机副本，保留本机设置。"""
+    with connect() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for table, _key in reversed(CLOUD_TABLES):
+            conn.execute(f"DELETE FROM {table}")
+        for table, key in CLOUD_TABLES:
+            columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+            rows = state.get(key) or []
+            if not rows:
+                continue
+            usable = [name for name in columns if name in rows[0] or name == "created_at"]
+            stamp = now_text()
+            values = []
+            for row in rows:
+                values.append(tuple(row.get(name) or stamp if name == "created_at" else row.get(name) for name in usable))
+            marks = ", ".join("?" for _ in usable)
+            conn.executemany(f"INSERT INTO {table}({', '.join(usable)}) VALUES({marks})", values)
+        fx = {"USD": _fx_blank(), "HKD": _fx_blank()}
+        for row in state.get("fx") or []:
+            if row.get("code") in fx and row.get("rate") is not None:
+                fx[row["code"]] = {"rate": float(row["rate"]), "source": row.get("source") or "手工", "at": row.get("quoted_at") or ""}
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES('fx', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (json.dumps(fx, ensure_ascii=False),),
+        )
+        if "txns" in state:
+            conn.execute("DELETE FROM account_txns")
+            marks = ", ".join("?" for _ in TXN_COLUMNS)
+            conn.executemany(
+                f"INSERT INTO account_txns({', '.join(TXN_COLUMNS)}) VALUES({marks})",
+                [tuple(row.get(name) for name in TXN_COLUMNS) for row in state["txns"]],
+            )
+        else:
+            conn.execute("DELETE FROM account_txns WHERE account_id NOT IN (SELECT id FROM accounts)")
+        if state.get("txnRev") is not None and "txns" in state:
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('txn_rev', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (state["txnRev"],),
+            )
+
+
+def clear_records():
+    with connect() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM account_txns")
+        for table, _key in reversed(CLOUD_TABLES):
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute("DELETE FROM settings WHERE key IN ('fx', 'txn_rev')")
+    init_db()
+
+
+def local_snapshot():
+    snapshot = {key: _all(f"SELECT * FROM {table}") for table, key in CLOUD_TABLES}
+    snapshot["txns"] = _all("SELECT * FROM account_txns ORDER BY account_id, txn_date, txn_time, id")
+    snapshot["fx"] = [
+        {"code": code, "rate": item["rate"], "source": item["source"], "quoted_at": item["at"]}
+        for code, item in fx_rates().items()
+        if item["rate"] is not None
+    ]
+    return snapshot
 
 
 def get_setting(key, default=None):
@@ -207,6 +366,8 @@ def fx_rates():
 
 
 def save_fx_rates(rates):
+    if remote := _remote():
+        return remote.save_fx_rates(rates)
     current = fx_rates()
     for code, item in rates.items():
         current[code] = {
@@ -239,6 +400,8 @@ def get_account(account_id):
 
 
 def save_account(data, account_id=None):
+    if remote := _remote():
+        return remote.save_account(data, account_id)
     name = data["name"].strip()
     if not name:
         raise ValueError("请填写账户名称")
@@ -271,7 +434,10 @@ def save_account(data, account_id=None):
 
 
 def delete_account(account_id):
+    if remote := _remote():
+        return remote.delete_account(account_id)
     with connect() as conn:
+        _unlink(conn, "account_id=?", (account_id,))
         conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
 
@@ -299,6 +465,8 @@ def latest_balance(account_id):
 
 
 def save_balance(data, entry_id=None):
+    if remote := _remote():
+        return remote.save_balance(data, entry_id)
     account_id = int(data["account_id"])
     as_of = data["as_of_date"]
     balance = r2(data["balance"])
@@ -309,7 +477,7 @@ def save_balance(data, entry_id=None):
                 conn.execute(
                     """
                     UPDATE balance_entries
-                    SET account_id=?, as_of_date=?, balance=?, note=?
+                    SET account_id=?, as_of_date=?, balance=?, note=?, source='手工'
                     WHERE id=?
                     """,
                     (account_id, as_of, balance, note, entry_id),
@@ -323,7 +491,8 @@ def save_balance(data, entry_id=None):
             VALUES(?, ?, ?, ?, ?)
             ON CONFLICT(account_id, as_of_date) DO UPDATE SET
                 balance=excluded.balance,
-                note=excluded.note
+                note=excluded.note,
+                source='手工'
             """,
             (account_id, as_of, balance, note, now_text()),
         )
@@ -335,8 +504,304 @@ def save_balance(data, entry_id=None):
 
 
 def delete_balance(entry_id):
+    if remote := _remote():
+        return remote.delete_balance(entry_id)
     with connect() as conn:
         conn.execute("DELETE FROM balance_entries WHERE id=?", (entry_id,))
+
+
+def get_import_map(account_id):
+    row = _one("SELECT import_map FROM accounts WHERE id=?", (account_id,))
+    if not row or not row["import_map"]:
+        return None
+    try:
+        return json.loads(row["import_map"])
+    except ValueError:
+        return None
+
+
+def _rebuild_balances(conn, account_id):
+    row = conn.execute("SELECT import_map FROM accounts WHERE id=?", (account_id,)).fetchone()
+    try:
+        opening = json.loads(row["import_map"]).get("opening") if row and row["import_map"] else None
+    except ValueError:
+        opening = None
+    txns = [
+        dict(item)
+        for item in conn.execute(
+            "SELECT txn_date, amount, balance FROM account_txns WHERE account_id=? ORDER BY txn_date, txn_time, id",
+            (account_id,),
+        )
+    ]
+    conn.execute("DELETE FROM balance_entries WHERE account_id=? AND source='明细'", (account_id,))
+    stamp = now_text()
+    for as_of, balance in statement.snapshot_points(txns, opening):
+        conn.execute(
+            """
+            INSERT INTO balance_entries(account_id, as_of_date, balance, note, source, created_at)
+            VALUES(?, ?, ?, '由明细生成', '明细', ?)
+            ON CONFLICT(account_id, as_of_date) DO UPDATE SET
+                balance=excluded.balance, note=excluded.note, source=excluded.source
+            """,
+            (account_id, as_of, balance, stamp),
+        )
+
+
+def save_import_map(account_id, mapping):
+    if remote := _remote():
+        return remote.save_import_map(account_id, mapping)
+    with connect() as conn:
+        conn.execute(
+            "UPDATE accounts SET import_map=? WHERE id=?",
+            (json.dumps(mapping, ensure_ascii=False) if mapping else "", account_id),
+        )
+        _rebuild_balances(conn, account_id)
+
+
+def import_txns(account_id, rows, mapping, batch, progress=None):
+    """追加明细，已存在的（指纹相同）自动跳过。返回 (新增, 跳过)。"""
+    if remote := _remote():
+        return remote.import_txns(account_id, rows, mapping, batch, progress)
+    stamp = now_text()
+    with connect() as conn:
+        if mapping is not None:
+            conn.execute("UPDATE accounts SET import_map=? WHERE id=?", (json.dumps(mapping, ensure_ascii=False), account_id))
+        before = conn.execute("SELECT COUNT(*) AS n FROM account_txns WHERE account_id=?", (account_id,)).fetchone()["n"]
+        conn.executemany(
+            """
+            INSERT INTO account_txns(account_id, txn_date, txn_time, amount, balance, counterparty, summary,
+                                     note, fingerprint, batch, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, fingerprint) DO NOTHING
+            """,
+            [
+                (
+                    account_id, row["txn_date"], row.get("txn_time") or "", r2(row["amount"]), r2(row.get("balance")),
+                    row.get("counterparty") or "", row.get("summary") or "", row.get("note") or "",
+                    row["fingerprint"], batch, stamp, stamp,
+                )
+                for row in rows
+            ],
+        )
+        after = conn.execute("SELECT COUNT(*) AS n FROM account_txns WHERE account_id=?", (account_id,)).fetchone()["n"]
+        _rebuild_balances(conn, account_id)
+    return after - before, len(rows) - (after - before)
+
+
+def list_txns(account_id):
+    return _all(
+        "SELECT * FROM account_txns WHERE account_id=? ORDER BY txn_date DESC, txn_time DESC, id DESC",
+        (account_id,),
+    )
+
+
+def txn_batches(account_id):
+    return _all(
+        """
+        SELECT batch, COUNT(*) AS n, MIN(txn_date) AS first, MAX(txn_date) AS last, MAX(created_at) AS at
+        FROM account_txns WHERE account_id=?
+        GROUP BY batch ORDER BY at DESC
+        """,
+        (account_id,),
+    )
+
+
+def _txn_fields(data):
+    day, _clock = statement.parse_date(data.get("txn_date"))
+    if not day:
+        raise ValueError("交易日期请写成 YYYY-MM-DD")
+    clock = statement.parse_time(data.get("txn_time")) if data.get("txn_time") else ""
+    if data.get("amount") in (None, ""):
+        raise ValueError("请填写金额")
+    return (
+        day, clock, r2(data["amount"]), r2(data.get("balance")),
+        (data.get("counterparty") or "").strip(), (data.get("summary") or "").strip(), (data.get("note") or "").strip(),
+    )
+
+
+def save_txn(data, txn_id=None):
+    """修改一笔明细；没有 txn_id 时在 data['account_id'] 下手工补一笔。"""
+    if remote := _remote():
+        return remote.save_txn(data, txn_id)
+    fields = _txn_fields(data)
+    stamp = now_text()
+    with connect() as conn:
+        if txn_id:
+            row = conn.execute("SELECT account_id FROM account_txns WHERE id=?", (txn_id,)).fetchone()
+            if row is None:
+                raise ValueError("这笔明细不存在")
+            conn.execute(
+                """
+                UPDATE account_txns SET txn_date=?, txn_time=?, amount=?, balance=?, counterparty=?, summary=?,
+                    note=?, updated_at=? WHERE id=?
+                """,
+                (*fields, stamp, txn_id),
+            )
+            updated = dict(conn.execute("SELECT * FROM account_txns WHERE id=?", (txn_id,)).fetchone())
+            payload = _expense_payload(updated, updated["treat"])
+            conn.execute(
+                "UPDATE expenses SET occurred_on=?, amount=?, payee=? WHERE txn_id=? AND source='明细'",
+                (updated["txn_date"], payload["amount"], payload["payee"], txn_id),
+            )
+            _rebuild_balances(conn, row["account_id"])
+            return txn_id
+        account_id = int(data["account_id"])
+        cur = conn.execute(
+            """
+            INSERT INTO account_txns(account_id, txn_date, txn_time, amount, balance, counterparty, summary,
+                                     note, fingerprint, batch, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '手工补录', ?, ?)
+            """,
+            (account_id, *fields, f"m-{uuid.uuid4()}", stamp, stamp),
+        )
+        _rebuild_balances(conn, account_id)
+        return cur.lastrowid
+
+
+def delete_txns(txn_ids):
+    if remote := _remote():
+        return remote.delete_txns(txn_ids)
+    ids = [int(item) for item in txn_ids]
+    if not ids:
+        return
+    with connect() as conn:
+        marks = ", ".join("?" for _ in ids)
+        owners = [row["account_id"] for row in conn.execute(f"SELECT DISTINCT account_id FROM account_txns WHERE id IN ({marks})", ids)]
+        _unlink(conn, f"id IN ({marks})", ids)
+        conn.execute(f"DELETE FROM account_txns WHERE id IN ({marks})", ids)
+        for account_id in owners:
+            _rebuild_balances(conn, account_id)
+
+
+def delete_txn_batch(account_id, batch):
+    if remote := _remote():
+        return remote.delete_txn_batch(account_id, batch)
+    with connect() as conn:
+        _unlink(conn, "account_id=? AND batch=?", (account_id, batch))
+        conn.execute("DELETE FROM account_txns WHERE account_id=? AND batch=?", (account_id, batch))
+        _rebuild_balances(conn, account_id)
+
+
+def _unlink(conn, where, args):
+    """明细删掉时：由明细生成的支出一起删；合并过的手工支出只解除关联。"""
+    inner = f"SELECT id FROM account_txns WHERE {where}"
+    conn.execute(f"DELETE FROM expenses WHERE source='明细' AND txn_id IN ({inner})", tuple(args))
+    conn.execute(f"UPDATE expenses SET txn_id=NULL WHERE txn_id IN ({inner})", tuple(args))
+
+
+def _expense_payload(txn, treat):
+    payee = (txn.get("counterparty") or txn.get("summary") or "")[:80]
+    summary = txn.get("summary") or ""
+    note = ("退款" + (f" · {summary}" if summary else "")) if treat == "退款" else summary
+    return {"amount": r2(-float(txn["amount"])), "payee": payee, "note": note[:300]}
+
+
+def list_rules():
+    return _all("SELECT * FROM txn_rules ORDER BY id")
+
+
+def delete_rules(rule_ids):
+    ids = [int(item) for item in rule_ids]
+    if not ids:
+        return
+    if remote := _remote():
+        return remote.delete_rules(ids)
+    with connect() as conn:
+        conn.execute(f"DELETE FROM txn_rules WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+
+def classify_txns(items, rules=()):
+    """items: [{id, treat, category_id, expense_id}]；rules: [{field, keyword, treat, category_id}]。"""
+    if remote := _remote():
+        return remote.classify_txns(items, rules)
+    stamp = now_text()
+    with connect() as conn:
+        categories = {row["id"] for row in conn.execute("SELECT id FROM expense_categories")}
+        used = set()
+        for item in items:
+            treat = item.get("treat") or ""
+            if treat not in TREATS:
+                raise ValueError("归类无效")
+            row = conn.execute("SELECT * FROM account_txns WHERE id=?", (int(item["id"]),)).fetchone()
+            if row is None:
+                raise ValueError("明细不存在")
+            txn = dict(row)
+            if treat == "支出" and txn["amount"] >= 0:
+                raise ValueError("收入不能归为支出")
+            if treat == "退款" and txn["amount"] <= 0:
+                raise ValueError("只有收入能记为退款")
+            _unlink(conn, "id=?", (txn["id"],))
+            category_id = None
+            merge_id = int(item.get("expense_id") or 0)
+            if treat == "支出" and merge_id:
+                target = conn.execute("SELECT id, category_id, txn_id FROM expenses WHERE id=?", (merge_id,)).fetchone()
+                if target is None or target["txn_id"] or merge_id in used:
+                    raise ValueError("要合并的手工支出不存在或已经合并过")
+                used.add(merge_id)
+                category_id = target["category_id"]
+                conn.execute("UPDATE expenses SET txn_id=? WHERE id=?", (txn["id"], merge_id))
+            elif treat in ("支出", "退款"):
+                category_id = int(item.get("category_id") or 0)
+                if category_id not in categories:
+                    raise ValueError("请选择支出类别")
+                payload = _expense_payload(txn, treat)
+                conn.execute(
+                    """
+                    INSERT INTO expenses(category_id, occurred_on, amount, payee, note, source, txn_id, created_at)
+                    VALUES(?, ?, ?, ?, ?, '明细', ?, ?)
+                    """,
+                    (category_id, txn["txn_date"], payload["amount"], payload["payee"], payload["note"], txn["id"], stamp),
+                )
+            conn.execute(
+                "UPDATE account_txns SET treat=?, category_id=?, updated_at=? WHERE id=?",
+                (treat, category_id, stamp, txn["id"]),
+            )
+        for rule in rules:
+            keyword = (rule.get("keyword") or "").strip()[:40]
+            treat = rule.get("treat")
+            if rule.get("field") not in ("counterparty", "summary") or not keyword or treat not in ("支出", "退款", "不计"):
+                continue
+            category_id = None if treat == "不计" else rule.get("category_id")
+            if treat != "不计" and category_id not in categories:
+                continue
+            conn.execute(
+                """
+                INSERT INTO txn_rules(field, keyword, treat, category_id, created_at) VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(field, keyword) DO UPDATE SET treat=excluded.treat, category_id=excluded.category_id
+                """,
+                (rule["field"], keyword, treat, category_id, stamp),
+            )
+    return {"classified": len(items)}
+
+
+def pending_count():
+    from gxyfi import classify
+
+    return len(classify.pending(list_txns_all_open(), list_rules()))
+
+
+def list_txns_all_open():
+    return _all(
+        """
+        SELECT t.*, a.name AS account_name FROM account_txns t JOIN accounts a ON a.id = t.account_id
+        WHERE t.treat='' ORDER BY t.txn_date DESC, t.id DESC
+        """
+    )
+
+
+def txn_counts():
+    rows = _all("SELECT account_id, COUNT(*) AS n, MAX(txn_date) AS last FROM account_txns GROUP BY account_id")
+    return {row["account_id"]: row for row in rows}
+
+
+def list_all_txns():
+    return _all(
+        """
+        SELECT t.*, a.name AS account_name, a.currency
+        FROM account_txns t JOIN accounts a ON a.id = t.account_id
+        ORDER BY a.name, t.txn_date, t.txn_time, t.id
+        """
+    )
 
 
 def list_all_balances():
@@ -370,6 +835,8 @@ def list_holdings():
 
 
 def save_holding(data, holding_id=None):
+    if remote := _remote():
+        return remote.save_holding(data, holding_id)
     name = data["name"].strip()
     symbol = data["symbol"].strip()
     if not name or not symbol:
@@ -413,8 +880,240 @@ def save_holding(data, holding_id=None):
 
 
 def delete_holding(holding_id):
+    if remote := _remote():
+        return remote.delete_holding(holding_id)
     with connect() as conn:
         conn.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
+
+
+def list_dca_plans():
+    return _all("SELECT * FROM dca_plans ORDER BY status, symbol, id")
+
+
+def list_dca_records(plan_id=None):
+    if plan_id is None:
+        return _all(
+            """
+            SELECT records.*, plans.name AS plan_name, plans.symbol AS plan_symbol
+            FROM dca_records AS records
+            JOIN dca_plans AS plans ON plans.id = records.plan_id
+            ORDER BY records.trade_date, records.id
+            """
+        )
+    return _all(
+        "SELECT * FROM dca_records WHERE plan_id=? ORDER BY trade_date, id",
+        (plan_id,),
+    )
+
+
+def _plan_or_raise(plan_id):
+    plan = _one("SELECT * FROM dca_plans WHERE id=?", (plan_id,))
+    if plan is None:
+        raise ValueError("定投计划不存在")
+    return plan
+
+
+def save_dca_plan(data, plan_id=None):
+    if remote := _remote():
+        return remote.save_dca_plan(data, plan_id)
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("请填写基金名称")
+    symbol = dca.normalize_symbol(data.get("symbol"))
+    amount = r2(data.get("amount"))
+    if amount is None or amount <= 0:
+        raise ValueError("每期金额需要大于 0")
+    cycle = data.get("cycle") or "每月"
+    if cycle not in dca.CYCLES:
+        raise ValueError("扣款周期不正确")
+    debit_day = int(data.get("debit_day") or 0)
+    limit = 28 if cycle == "每月" else 5
+    if debit_day < 1 or debit_day > limit:
+        raise ValueError("扣款日不在可选范围内")
+    status = data.get("status") or "进行中"
+    if status not in dca.STATUSES:
+        raise ValueError("状态不正确")
+    started_on = data.get("started_on") or None
+    manual_nav = r4(data.get("manual_nav"))
+    if manual_nav is not None and manual_nav <= 0:
+        raise ValueError("最新净值需要大于 0")
+    fields = (
+        name,
+        symbol,
+        amount,
+        cycle,
+        debit_day,
+        status,
+        started_on,
+        manual_nav,
+        str(data.get("note") or "").strip(),
+    )
+    with connect() as conn:
+        if plan_id:
+            if conn.execute("SELECT 1 FROM dca_plans WHERE id=?", (plan_id,)).fetchone() is None:
+                raise ValueError("定投计划不存在")
+            conn.execute(
+                """
+                UPDATE dca_plans
+                SET name=?, symbol=?, amount=?, cycle=?, debit_day=?, status=?,
+                    started_on=?, manual_nav=?, note=?
+                WHERE id=?
+                """,
+                (*fields, plan_id),
+            )
+            return plan_id
+        cur = conn.execute(
+            """
+            INSERT INTO dca_plans(
+                name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*fields, now_text()),
+        )
+        return cur.lastrowid
+
+
+def delete_dca_plan(plan_id):
+    if remote := _remote():
+        return remote.delete_dca_plan(plan_id)
+    with connect() as conn:
+        conn.execute("DELETE FROM dca_plans WHERE id=?", (plan_id,))
+
+
+def _checked_records(plan_id, draft):
+    _plan_or_raise(plan_id)
+    dca.apply_position(draft)
+
+
+def save_dca_record(data, record_id=None):
+    if remote := _remote():
+        return remote.save_dca_record(data, record_id)
+    plan_id = data.get("plan_id")
+    normalized = dca.normalize_record(data)
+    existing = list_dca_records(plan_id)
+    draft = []
+    replaced = record_id is None
+    for row in existing:
+        if row["id"] == record_id:
+            draft.append({**normalized, "id": record_id})
+            replaced = True
+        else:
+            draft.append(row)
+    if record_id is not None and not replaced:
+        raise ValueError("确认记录不存在")
+    if record_id is None:
+        draft.append({**normalized, "id": 10**12})
+    _checked_records(plan_id, draft)
+    fields = (
+        plan_id,
+        normalized["kind"],
+        normalized["trade_date"],
+        normalized["amount"],
+        normalized["nav"],
+        normalized["shares"],
+        normalized["fee"],
+        normalized["note"],
+    )
+    with connect() as conn:
+        if record_id:
+            conn.execute(
+                """
+                UPDATE dca_records
+                SET plan_id=?, kind=?, trade_date=?, amount=?, nav=?, shares=?, fee=?, note=?
+                WHERE id=?
+                """,
+                (*fields, record_id),
+            )
+            return record_id
+        cur = conn.execute(
+            """
+            INSERT INTO dca_records(
+                plan_id, kind, trade_date, amount, nav, shares, fee, note, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*fields, now_text()),
+        )
+        return cur.lastrowid
+
+
+def delete_dca_record(record_id):
+    if remote := _remote():
+        return remote.delete_dca_record(record_id)
+    current = _one("SELECT * FROM dca_records WHERE id=?", (record_id,))
+    if current is None:
+        return
+    remaining = [row for row in list_dca_records(current["plan_id"]) if row["id"] != record_id]
+    dca.apply_position(remaining)
+    with connect() as conn:
+        conn.execute("DELETE FROM dca_records WHERE id=?", (record_id,))
+
+
+def import_dca_records(plan_id, path):
+    if remote := _remote():
+        return remote.import_dca_records(plan_id, path)
+    incoming = dca.read_xlsx(path)
+    existing = list_dca_records(plan_id)
+    draft = list(existing)
+    for index, row in enumerate(incoming):
+        draft.append({**row, "id": 10**12 + index})
+    _checked_records(plan_id, draft)
+    with connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO dca_records(
+                plan_id, kind, trade_date, amount, nav, shares, fee, note, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    plan_id,
+                    row["kind"],
+                    row["trade_date"],
+                    row["amount"],
+                    row["nav"],
+                    row["shares"],
+                    row["fee"],
+                    row["note"],
+                    now_text(),
+                )
+                for row in incoming
+            ],
+        )
+    return len(incoming)
+
+
+def dca_plan_rows():
+    plans = list_dca_plans()
+    grouped = {}
+    for row in list_dca_records():
+        grouped.setdefault(row["plan_id"], []).append(row)
+    valued = []
+    total = 0.0
+    unpriced = 0
+    for plan in plans:
+        records = grouped.get(plan["id"], [])
+        shares, cost = dca.apply_position(records)
+        nav, source = dca.latest_nav(plan["manual_nav"], records)
+        market_value = None if nav is None or shares <= 0 else round(shares * nav, 2)
+        pnl = None if market_value is None else round(market_value - cost, 2)
+        if shares > 0 and nav is None:
+            unpriced += 1
+        if market_value is not None:
+            total += market_value
+        valued.append(
+            {
+                **plan,
+                "shares": shares,
+                "cost": cost,
+                "nav": nav,
+                "nav_source": source,
+                "market_value": market_value,
+                "pnl": pnl,
+                "cycle_label": dca.cycle_label(plan["cycle"], plan["debit_day"]),
+                "records": len(records),
+            }
+        )
+    return valued, round(total, 2), unpriced
 
 
 def list_quotes():
@@ -464,6 +1163,8 @@ def list_properties():
 
 
 def save_property(data, property_id=None):
+    if remote := _remote():
+        return remote.save_property(data, property_id)
     name = data["name"].strip()
     if not name:
         raise ValueError("请填写不动产名称")
@@ -511,6 +1212,8 @@ def save_property(data, property_id=None):
 
 
 def delete_property(property_id):
+    if remote := _remote():
+        return remote.delete_property(property_id)
     with connect() as conn:
         conn.execute("DELETE FROM properties WHERE id=?", (property_id,))
 
@@ -520,6 +1223,8 @@ def list_categories():
 
 
 def save_category(name):
+    if remote := _remote():
+        return remote.save_category(name)
     cleaned = name.strip()
     if not cleaned:
         raise ValueError("请填写类别名称")
@@ -547,6 +1252,8 @@ def list_expenses():
 
 
 def save_expense(data, expense_id=None):
+    if remote := _remote():
+        return remote.save_expense(data, expense_id)
     amount = r2(data["amount"])
     if amount is None or amount <= 0:
         raise ValueError("支出金额需要大于 0")
@@ -567,6 +1274,13 @@ def save_expense(data, expense_id=None):
                 """,
                 (*fields, expense_id),
             )
+            conn.execute(
+                """
+                UPDATE account_txns SET category_id=?, updated_at=?
+                WHERE id=(SELECT txn_id FROM expenses WHERE id=?)
+                """,
+                (fields[0], now_text(), expense_id),
+            )
             return expense_id
         cur = conn.execute(
             """
@@ -579,7 +1293,16 @@ def save_expense(data, expense_id=None):
 
 
 def delete_expense(expense_id):
+    if remote := _remote():
+        return remote.delete_expense(expense_id)
     with connect() as conn:
+        conn.execute(
+            """
+            UPDATE account_txns SET treat='不计', category_id=NULL, updated_at=?
+            WHERE id=(SELECT txn_id FROM expenses WHERE id=?)
+            """,
+            (now_text(), expense_id),
+        )
         conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
 
 
@@ -616,6 +1339,8 @@ def budget_progress(year):
 
 
 def save_budget(year, category_id, amount, note=""):
+    if remote := _remote():
+        return remote.save_budget(year, category_id, amount, note)
     with connect() as conn:
         conn.execute(
             """
@@ -763,6 +1488,8 @@ def portfolio_summary(today=None):
                 stale.append({**row, "age": age})
         accounts.append({**row, "cny": cny, "age": age})
     holdings, invest, invest_missing = valued_holdings(rates)
+    dca_rows, dca_total, dca_unpriced = dca_plan_rows()
+    invest += dca_total
     properties = []
     equity_total = 0.0
     rent_total = 0.0
@@ -791,9 +1518,10 @@ def portfolio_summary(today=None):
         "savings_cny": savings,
         "savings_missing": savings_missing,
         "holdings": holdings,
+        "dca_plans": dca_rows,
         "invest_cny": invest,
         "invest_missing": invest_missing,
-        "unpriced": sum(1 for row in holdings if row["price"] is None),
+        "unpriced": sum(1 for row in holdings if row["price"] is None) + dca_unpriced,
         "properties": properties,
         "property_equity_cny": equity_total,
         "property_missing": property_missing,

@@ -173,13 +173,36 @@ def export_workbook(path):
                 row["currency"],
                 _as_date(row["as_of_date"]),
                 row["balance"],
+                row.get("source") or "手工",
                 row["note"],
             ]
         )
     write_table(
         wb.create_sheet("余额快照"),
-        ["账户", "机构", "币种", "日期", "余额", "备注"],
+        ["账户", "机构", "币种", "日期", "余额", "来源", "备注"],
         balance_rows,
+    )
+
+    txn_rows = []
+    for row in db.list_all_txns():
+        txn_rows.append(
+            [
+                row["account_name"],
+                _as_date(row["txn_date"]),
+                row["txn_time"],
+                row["amount"] if row["amount"] > 0 else None,
+                -row["amount"] if row["amount"] < 0 else None,
+                row["balance"],
+                row["counterparty"],
+                row["summary"],
+                row["note"],
+                row["batch"],
+            ]
+        )
+    write_table(
+        wb.create_sheet("账户明细"),
+        ["账户", "日期", "时间", "收入", "支出", "交易后余额", "对方户名", "摘要", "备注", "导入批次"],
+        txn_rows,
     )
 
     holding_rows = []
@@ -207,6 +230,53 @@ def export_workbook(path):
         ["名称", "代码", "市场", "数量", "币种", "成本价", "现价", "价格来源", "行情时间", "市值（原币）", "市值（人民币）", "浮盈（原币）", "账户", "备注"],
         holding_rows,
         formats={4: "0.0000", 6: "0.0000", 7: "0.0000"},
+    )
+
+    plan_rows = []
+    for row in summary["dca_plans"]:
+        plan_rows.append(
+            [
+                row["name"],
+                row["symbol"],
+                row["amount"],
+                row["cycle_label"],
+                row["status"],
+                _as_date(row["started_on"]),
+                row["shares"],
+                row["cost"],
+                row["nav"],
+                row["nav_source"],
+                row["market_value"],
+                row["pnl"],
+                row["note"],
+            ]
+        )
+    write_table(
+        wb.create_sheet("基金定投"),
+        ["基金", "代码", "每期金额", "周期", "状态", "开始日期", "份额", "成本", "净值", "净值来源", "市值", "浮盈", "备注"],
+        plan_rows,
+        formats={7: "0.0000", 9: "0.0000"},
+    )
+    record_rows = []
+    for row in db.list_dca_records():
+        record_rows.append(
+            [
+                row["plan_name"],
+                row["plan_symbol"],
+                row["kind"],
+                _as_date(row["trade_date"]),
+                row["amount"],
+                row["nav"],
+                row["shares"],
+                row["fee"],
+                row["note"],
+            ]
+        )
+    write_table(
+        wb.create_sheet("定投记录"),
+        ["基金", "代码", "类型", "确认日期", "金额", "确认净值", "确认份额", "手续费", "备注"],
+        record_rows,
+        formats={6: "0.0000", 7: "0.0000"},
     )
 
     property_rows = []

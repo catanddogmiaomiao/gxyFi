@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from datetime import date
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -18,7 +20,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gxyfi import db
+from gxyfi import cloud, db
+from gxyfi.sync_ui import SyncDialog
 from gxyfi.export_excel import export_workbook
 from gxyfi.market import fetch_refresh
 from gxyfi.pages import (
@@ -48,6 +51,30 @@ class RefreshWorker(QThread):
         self.finished_payload.emit(payload)
 
 
+class CloudWorker(QThread):
+    """在后台向网页端取整本账（或让网页端刷新行情后取回）。"""
+
+    done = pyqtSignal(object, object)
+
+    def __init__(self, quotes=False):
+        super().__init__()
+        self.quotes = quotes
+        self.cfg = cloud.config()
+        self.writes = cloud.WRITES
+
+    def run(self):
+        try:
+            state = cloud.fetch_quotes(self.cfg) if self.quotes else cloud.fetch_state(self.cfg)
+        except Exception as exc:
+            self.done.emit(None, exc)
+            return
+        self.done.emit(state, None)
+
+
+PULL_EVERY_MS = 60_000
+PULL_ON_FOCUS_AFTER = 15
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -55,6 +82,9 @@ class MainWindow(QMainWindow):
         self.resize(1360, 860)
         self.setMinimumSize(1180, 720)
         self._worker = None
+        self._pull_worker = None
+        self._last_pull = 0.0
+        self._offline = False
 
         shell = QWidget()
         root = QHBoxLayout(shell)
@@ -93,11 +123,16 @@ class MainWindow(QMainWindow):
         status = QStatusBar()
         self.setStatusBar(status)
         self._status = status
-        permanent = QLabel("仅保存在这台电脑")
-        permanent.setObjectName("TopMeta")
-        status.addPermanentWidget(permanent)
+        self.cloud_label = QLabel("")
+        self.cloud_label.setObjectName("TopMeta")
+        status.addPermanentWidget(self.cloud_label)
         status.showMessage("行情只用于估值，有延迟，不构成投资建议")
         self.show_page(0)
+        self._refresh_cloud_label()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.pull)
+        self._timer.start(PULL_EVERY_MS)
+        QTimer.singleShot(300, self.pull)
 
     def _sidebar(self):
         side = QWidget()
@@ -147,6 +182,11 @@ class MainWindow(QMainWindow):
         export_btn.setObjectName("PrimaryButton")
         export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         export_btn.clicked.connect(self.export_excel)
+        self.sync_btn = QPushButton("网页同步")
+        self.sync_btn.setObjectName("GhostButton")
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.clicked.connect(self.open_sync)
+        layout.addWidget(self.sync_btn)
         layout.addWidget(self.refresh_btn)
         layout.addWidget(export_btn)
         return bar
@@ -166,8 +206,95 @@ class MainWindow(QMainWindow):
             return
         self.fx_label.setText(f"USD/CNY {usd['rate']:.4f} · {usd['source']}")
 
+    def _refresh_cloud_label(self):
+        cfg = cloud.config()
+        if not cloud.enabled():
+            self.cloud_label.setText("仅保存在这台电脑")
+            self.sync_btn.setText("网页同步")
+        elif cloud.expired():
+            self.cloud_label.setText(f"网页账号 {cfg['user']} · 登录已过期，只能查看")
+            self.sync_btn.setText("重新登录")
+        elif self._offline:
+            self.cloud_label.setText(f"网页账号 {cfg['user']} · 离线，显示 {cfg['synced_at']} 的内容")
+            self.sync_btn.setText("网页同步 · 离线")
+        else:
+            self.cloud_label.setText(f"网页账号 {cfg['user']} · 已同步 {cfg['synced_at']}")
+            self.sync_btn.setText("网页同步 · 已连接")
+
+    def _reload(self):
+        self.show_page(self.stack.currentIndex())
+        self._refresh_cloud_label()
+
+    def open_sync(self):
+        dialog = SyncDialog(self, self.pull_now)
+        dialog.exec()
+        self._offline = False
+        self._reload()
+        if dialog.changed:
+            self._status.showMessage(cloud.config()["user"] and "已切换到网页账号" or "已退出网页账号，这台电脑上的缓存已清空")
+
+    def pull_now(self):
+        self.pull(force=True)
+
+    def pull(self, force=False):
+        if not cloud.enabled() or cloud.expired():
+            return
+        if self._pull_worker and self._pull_worker.isRunning():
+            return
+        if not force and QApplication.activeModalWidget() is not None:
+            return
+        self._last_pull = time.monotonic()
+        if force:
+            self._status.showMessage("正在从网页端同步…")
+        self._pull_worker = CloudWorker()
+        self._pull_worker.done.connect(lambda state, error: self._pulled(state, error, force))
+        self._pull_worker.start()
+
+    def _pulled(self, state, error, loud):
+        worker = self._pull_worker
+        if error is not None:
+            if isinstance(error, cloud.AuthExpired):
+                cloud.mark_expired()
+                self._status.showMessage("网页端登录已过期，请点右上角「重新登录」。")
+            else:
+                self._offline = True
+                if loud:
+                    self._status.showMessage(f"同步失败：{error}")
+            self._refresh_cloud_label()
+            return
+        self._offline = False
+        if worker.writes != cloud.WRITES or worker.cfg["user"] != cloud.config()["user"] or not cloud.enabled():
+            return
+        if QApplication.activeModalWidget() is not None and not loud:
+            self._refresh_cloud_label()
+            return
+        cloud.apply(state)
+        self._reload()
+        if loud:
+            self._status.showMessage("已从网页端同步")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.ActivationChange
+            and self.isActiveWindow()
+            and time.monotonic() - self._last_pull > PULL_ON_FOCUS_AFTER
+        ):
+            self.pull()
+
     def refresh_quotes(self):
         if self._worker and self._worker.isRunning():
+            return
+        if cloud.enabled():
+            if cloud.expired():
+                QMessageBox.warning(self, "不能刷新", "网页端登录已过期，请点右上角「重新登录」。")
+                return
+            self.refresh_btn.setEnabled(False)
+            self.refresh_btn.setText("刷新中…")
+            self._status.showMessage("网页端正在获取黄金、A 股、美股和汇率…")
+            self._worker = CloudWorker(quotes=True)
+            self._worker.done.connect(self._cloud_quotes_ready)
+            self._worker.start()
             return
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("刷新中…")
@@ -193,6 +320,26 @@ class MainWindow(QMainWindow):
         message += " 仅供估值，有延迟，不构成投资建议。"
         self._status.showMessage(message)
         self.show_page(self.stack.currentIndex())
+
+    def _cloud_quotes_ready(self, state, error):
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("刷新行情")
+        if error is not None:
+            if isinstance(error, cloud.AuthExpired):
+                cloud.mark_expired()
+            self._status.showMessage(f"行情没有刷新：{error}")
+            self._refresh_cloud_label()
+            return
+        if not cloud.enabled():
+            return
+        problems = state.pop("quoteErrors", None) or []
+        cloud.apply(state)
+        self._offline = False
+        self._reload()
+        message = "网页端已刷新行情。"
+        if problems:
+            message += " 未取到：" + "；".join(str(item) for item in problems[:4]) + "。"
+        self._status.showMessage(message + " 仅供估值，有延迟，不构成投资建议。")
 
     def export_excel(self):
         desktop = Path.home() / "Desktop"
