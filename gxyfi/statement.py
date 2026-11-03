@@ -440,22 +440,38 @@ def parse(rows, mapping):
     }
 
 
-def daily_balances(txns, opening=None):
-    """按日期得到每天日终余额。有余额列的行以余额为准，否则从期初余额累加金额。"""
+def daily_balances(txns, opening=None, anchors=()):
+    """按日期得到每天日终余额。
+
+    anchors 是已经记下来的余额（日期, 金额），表示该日日终余额，当天的交易已包含在内。
+    之后没有余额列的交易从最近一个这样的余额继续累加。交易自带余额时，以那一笔为准。
+    """
+    anchor_at = {}
+    for day, balance in anchors:
+        anchor_at[day] = float(balance)
+    by_day = {}
+    for row in txns:
+        by_day.setdefault(row["txn_date"], []).append(row)
     running = float(opening or 0)
     out = {}
-    for row in txns:
-        if row.get("balance") is not None:
-            running = float(row["balance"])
+    for day in sorted(set(by_day) | set(anchor_at)):
+        rows = by_day.get(day, [])
+        if day in anchor_at and all(row.get("balance") is None for row in rows):
+            running = anchor_at[day]
         else:
-            running = round(running + float(row["amount"]), 2)
-        out[row["txn_date"]] = round(running, 2)
+            for row in rows:
+                if row.get("balance") is not None:
+                    running = float(row["balance"])
+                else:
+                    running = round(running + float(row["amount"]), 2)
+        if rows:
+            out[day] = round(running, 2)
     return out
 
 
-def snapshot_points(txns, opening=None):
+def snapshot_points(txns, opening=None, anchors=()):
     """每个月最后一个有交易的日期，加上最后一天，生成余额快照。"""
-    daily = daily_balances(txns, opening)
+    daily = daily_balances(txns, opening, anchors)
     if not daily:
         return []
     picks = {}

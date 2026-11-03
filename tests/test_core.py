@@ -58,6 +58,14 @@ class CoreTest(unittest.TestCase):
         )
         self.assertEqual(yahoo["price"], 10.5)
         self.assertEqual(yahoo["currency"], "USD")
+        # chartPreviousClose 故意给错，日 K 倒数第二根才是昨收
+        yahoo = market.parse_yahoo_chart({
+            "chart": {"result": [{
+                "meta": {"regularMarketPrice": 59.97, "chartPreviousClose": 90.47, "currency": "USD", "shortName": "Intel", "regularMarketTime": 0},
+                "indicators": {"quote": [{"close": [92.07, 65.76, 59.97]}]},
+            }]},
+        })
+        self.assertAlmostEqual(yahoo["prev_close"], 65.76)
 
     def test_ledger_math(self):
         account = db.save_account({"name": "工资卡", "institution": "招行", "kind": "活期", "currency": "CNY", "note": ""})

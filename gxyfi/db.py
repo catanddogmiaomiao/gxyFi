@@ -473,6 +473,7 @@ def save_balance(data, entry_id=None):
     note = data.get("note", "").strip()
     with connect() as conn:
         if entry_id:
+            previous = conn.execute("SELECT account_id FROM balance_entries WHERE id=?", (entry_id,)).fetchone()
             try:
                 conn.execute(
                     """
@@ -484,6 +485,9 @@ def save_balance(data, entry_id=None):
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("这个账户在这一天已经有一条余额") from exc
+            _rebuild_balances(conn, account_id)
+            if previous is not None and previous["account_id"] != account_id:
+                _rebuild_balances(conn, previous["account_id"])
             return entry_id
         conn.execute(
             """
@@ -500,14 +504,19 @@ def save_balance(data, entry_id=None):
             "SELECT id FROM balance_entries WHERE account_id=? AND as_of_date=?",
             (account_id, as_of),
         ).fetchone()
-        return row["id"]
+        entry_id = row["id"]
+        _rebuild_balances(conn, account_id)
+        return entry_id
 
 
 def delete_balance(entry_id):
     if remote := _remote():
         return remote.delete_balance(entry_id)
     with connect() as conn:
+        row = conn.execute("SELECT account_id FROM balance_entries WHERE id=?", (entry_id,)).fetchone()
         conn.execute("DELETE FROM balance_entries WHERE id=?", (entry_id,))
+        if row is not None:
+            _rebuild_balances(conn, row["account_id"])
 
 
 def get_import_map(account_id):
@@ -526,6 +535,16 @@ def _rebuild_balances(conn, account_id):
         opening = json.loads(row["import_map"]).get("opening") if row and row["import_map"] else None
     except ValueError:
         opening = None
+    anchors = [
+        (row["as_of_date"], row["balance"])
+        for row in conn.execute(
+            """
+            SELECT as_of_date, balance FROM balance_entries
+            WHERE account_id=? AND source!='明细' ORDER BY as_of_date, id
+            """,
+            (account_id,),
+        )
+    ]
     txns = [
         dict(item)
         for item in conn.execute(
@@ -535,7 +554,10 @@ def _rebuild_balances(conn, account_id):
     ]
     conn.execute("DELETE FROM balance_entries WHERE account_id=? AND source='明细'", (account_id,))
     stamp = now_text()
-    for as_of, balance in statement.snapshot_points(txns, opening):
+    manual_dates = {day for day, _balance in anchors}
+    for as_of, balance in statement.snapshot_points(txns, opening, anchors):
+        if as_of in manual_dates:
+            continue
         conn.execute(
             """
             INSERT INTO balance_entries(account_id, as_of_date, balance, note, source, created_at)
@@ -1441,7 +1463,9 @@ def valued_holdings(rates=None):
         cost = None if holding["avg_cost"] is None else holding["avg_cost"] * holding["quantity"]
         pnl = None if market_value is None or cost is None else market_value - cost
         cny = None if market_value is None else to_cny(market_value, holding["currency"], rates)
+        cost_cny = None if cost is None else to_cny(cost, holding["currency"], rates)
         pnl_cny = None if pnl is None else to_cny(pnl, holding["currency"], rates)
+        ret = None if pnl is None or not cost else pnl / cost
         if market_value is not None and cny is None:
             missing = True
         if cny is not None:
@@ -1461,11 +1485,29 @@ def valued_holdings(rates=None):
                 "cost": cost,
                 "pnl": pnl,
                 "cny": cny,
+                "cost_cny": cost_cny,
                 "pnl_cny": pnl_cny,
+                "ret": ret,
                 "day": day,
             }
         )
+    for row in valued:
+        row["weight"] = None if row["cny"] is None or not total else row["cny"] / total
     return valued, total, missing
+
+
+def holdings_totals(rows):
+    """只合计填了成本、也有价格的持仓，收益率才有意义。"""
+    priced = [row for row in rows if row["cny"] is not None and row["cost_cny"] is not None]
+    cost = sum(row["cost_cny"] for row in priced)
+    value = sum(row["cny"] for row in priced)
+    return {
+        "value": sum(row["cny"] for row in rows if row["cny"] is not None),
+        "cost": cost,
+        "pnl": value - cost,
+        "ret": None if not cost else (value - cost) / cost,
+        "without_cost": sum(1 for row in rows if row["cny"] is not None and row["cost_cny"] is None),
+    }
 
 
 def portfolio_summary(today=None):

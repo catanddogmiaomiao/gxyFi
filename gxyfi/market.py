@@ -180,6 +180,23 @@ def parse_eastmoney_payload(obj: dict) -> dict:
     }
 
 
+def previous_close_from_yahoo(result, meta):
+    """Yahoo 的 chartPreviousClose 在 range=5d 时经常不是上一交易日收盘价，会把当日涨跌算错。
+
+    优先用 previousClose；没有时取日 K 线倒数第二根收盘价；再不行才退回 chartPreviousClose。
+    """
+    for key in ("previousClose", "regularMarketPreviousClose"):
+        value = meta.get(key)
+        if value not in (None, ""):
+            return float(value)
+    closes = (((result.get("indicators") or {}).get("quote") or [{}])[0].get("close") or [])
+    closes = [float(item) for item in closes if item is not None]
+    if len(closes) >= 2:
+        return closes[-2]
+    value = meta.get("chartPreviousClose")
+    return None if value in (None, "") else float(value)
+
+
 def parse_yahoo_chart(obj: dict) -> dict:
     result = ((obj.get("chart") or {}).get("result") or [None])[0]
     if not result:
@@ -189,7 +206,7 @@ def parse_yahoo_chart(obj: dict) -> dict:
     price = meta.get("regularMarketPrice")
     if price is None:
         raise ValueError("Yahoo 没有返回最新价")
-    prev = meta.get("chartPreviousClose", meta.get("previousClose"))
+    prev = previous_close_from_yahoo(result, meta)
     stamp = meta.get("regularMarketTime")
     quoted = ""
     if stamp:
@@ -197,7 +214,7 @@ def parse_yahoo_chart(obj: dict) -> dict:
     return {
         "name": meta.get("shortName") or meta.get("symbol") or "",
         "price": float(price),
-        "prev_close": None if prev is None else float(prev),
+        "prev_close": prev,
         "currency": meta.get("currency") or "",
         "quoted_at": quoted,
     }

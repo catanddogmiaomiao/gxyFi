@@ -100,6 +100,7 @@ class MappingDialog(QDialog):
         self.setModal(True)
         self.resize(1240, 760)
         self.rows = rows
+        self.account_id = account["id"]
         self.mapping = copy.deepcopy(mapping)
         self.existing = existing
         self.result = None
@@ -262,6 +263,11 @@ class MappingDialog(QDialog):
             text = label + (" *" if field in needed else "")
             self.form.labelForField(self.boxes[field]).setText(text)
         has_balance = bool(self.mapping["columns"].get("balance"))
+        anchors = [
+            (row["as_of_date"], row["balance"])
+            for row in db.list_balances(self.account_id)
+            if row.get("source") != "明细"
+        ]
         self.form.setRowVisible(self.opening, not has_balance)
 
         warnings = []
@@ -284,8 +290,22 @@ class MappingDialog(QDialog):
             again = sum(1 for row in rows if row["fingerprint"] in self.existing)
             parts = [f"读出 {len(rows)} 笔", _span(rows), f"收入 {fmt_money(income)}", f"支出 {fmt_money(expense)}"]
             if rows:
-                last = statement.daily_balances(rows, self.mapping["opening"])
+                last = statement.daily_balances(rows, self.mapping["opening"], () if has_balance else anchors)
                 parts.append(f"最后余额 {fmt_money(last[max(last)])}")
+                if not has_balance:
+                    first = rows[0]["txn_date"]
+                    prior = [item for item in anchors if item[0] < first]
+                    if prior:
+                        day, value = max(prior)
+                        parts.append(f"从 {day} 的余额 {fmt_money(value)} 继续")
+                    else:
+                        late = [item for item in anchors if item[0] >= first]
+                        if late:
+                            day, value = max(late)
+                            warnings.append(
+                                f"这个账户在 {day} 有一笔余额 {fmt_money(value)}，但日期不早于第一笔交易（{first}），没有当作起始余额。"
+                                "如果这是上期账单，请把日期改到第一笔之前，改完后余额会重算。"
+                            )
             self.summary.setText(" · ".join(parts))
             if again:
                 warnings.append(f"其中 {again} 笔之前已经导入过，会自动跳过。")

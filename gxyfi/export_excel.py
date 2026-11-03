@@ -216,20 +216,23 @@ def export_workbook(path):
                 row["currency"],
                 row["avg_cost"],
                 row["price"],
+                None if row["ret"] is None else round(row["ret"], 4),
                 row["source"],
                 row["quoted_at"],
-                None if row["market_value"] is None else round(row["market_value"], 2),
+                None if row["cost_cny"] is None else round(row["cost_cny"], 2),
                 None if row["cny"] is None else round(row["cny"], 2),
-                None if row["pnl"] is None else round(row["pnl"], 2),
+                None if row["pnl_cny"] is None else round(row["pnl_cny"], 2),
+                None if row["weight"] is None else round(row["weight"], 4),
                 row["account_label"],
                 row["note"],
             ]
         )
     write_table(
         wb.create_sheet("投资持仓"),
-        ["名称", "代码", "市场", "数量", "币种", "成本价", "现价", "价格来源", "行情时间", "市值（原币）", "市值（人民币）", "浮盈（原币）", "账户", "备注"],
+        ["名称", "代码", "市场", "数量", "币种", "成本价", "现价", "收益率", "价格来源", "行情时间",
+         "成本（人民币）", "市值（人民币）", "浮盈（人民币）", "占比", "账户", "备注"],
         holding_rows,
-        formats={4: "0.0000", 6: "0.0000", 7: "0.0000"},
+        formats={4: "0.0000", 6: "0.0000", 7: "0.0000", 8: "0.00%", 14: "0.00%"},
     )
 
     plan_rows = []

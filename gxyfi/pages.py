@@ -7,12 +7,14 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -20,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gxyfi import db
+from gxyfi import db, spending
 from gxyfi.dca import write_template
 from gxyfi.dialogs import (
     edit_account,
@@ -44,13 +46,15 @@ from gxyfi.widgets import (
     FLAT,
     GOLD,
     UP,
+    CategoryBars,
     MetricCard,
     MixBar,
-    MonthBars,
     Page,
     Panel,
     make_table,
     pnl_color,
+    StackedMonths,
+    category_colors,
     selected_id,
     set_cell,
 )
@@ -104,8 +108,9 @@ class DashboardPage(Page):
         left = Panel("资产结构")
         self.mix = MixBar()
         left.body.addWidget(self.mix)
-        right = Panel("近六月支出")
-        self.bars = MonthBars()
+        right = Panel("近六月支出 · 按类别")
+        self.bars = StackedMonths()
+        self.bars.setCursor(Qt.CursorShape.ArrowCursor)
         right.body.addWidget(self.bars)
         bottom = QHBoxLayout()
         bottom.setSpacing(12)
@@ -151,7 +156,9 @@ class DashboardPage(Page):
                 ("不动产", summary["property_equity_cny"]),
             ]
         )
-        self.bars.set_rows(summary["monthly_expenses"])
+        keys, names, cells = spending.monthly_stack(db.list_expenses(), 6)
+        colors = category_colors([row["name"] for row in db.list_categories()])
+        self.bars.set_data(keys, names, cells, colors)
         if summary["stale_accounts"]:
             names = "、".join(f"{item['name']}（{item['age']} 天）" for item in summary["stale_accounts"][:4])
             self.hint.setText(f"这些账户超过 {db.STALE_DAYS} 天没有更新余额：{names}")
@@ -425,12 +432,18 @@ class HoldingsPage(Page):
     def __init__(self):
         super().__init__(
             "投资",
-            "股票和黄金记在上面。基金定投记在下面：先建计划，再记每一期确认。只知道当前份额时记一笔期初；要留下每期扣款，用 Excel 导入历史。同一只基金不要在两处各记一份份额。",
+            "股票和黄金记在上面。收益率 = 现价 ÷ 成本价 − 1，按原币计算；成本、市值、浮盈按当前汇率折成人民币。当日涨跌看「行情」页。"
+            "基金定投记在下面：先建计划，再记每一期确认。同一只基金不要在两处各记一份份额。",
         )
         self.add_action("新增持仓", self.add_holding, "primary")
         self.add_action("编辑", self.edit_holding)
         self.add_action("删除", self.delete_holding, "danger")
-        self.table = make_table(["名称", "代码", "市场", "数量", "成本价", "现价", "涨跌", "市值¥", "浮盈¥", "来源"])
+        self.holding_summary = QLabel("")
+        self.holding_summary.setObjectName("TopMeta")
+        self.toolbar.addSpacing(12)
+        self.toolbar.addWidget(self.holding_summary)
+        self.toolbar.addStretch(1)
+        self.table = make_table(["名称", "代码", "市场", "数量", "成本价", "现价", "收益率", "成本¥", "市值¥", "浮盈¥", "占比", "来源"])
         self.table.setMinimumHeight(160)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit_holding())
         dca_box = QWidget()
@@ -507,13 +520,29 @@ class HoldingsPage(Page):
             set_cell(self.table, index, 1, row["symbol"])
             set_cell(self.table, index, 2, MARKET_LABEL.get(row["market"], row["market"]))
             set_cell(self.table, index, 3, fmt_price(row["quantity"]), align="right")
-            set_cell(self.table, index, 4, fmt_price(row["avg_cost"]), align="right")
+            set_cell(self.table, index, 4, "未填" if row["avg_cost"] is None else fmt_price(row["avg_cost"]), align="right",
+                     color=FLAT if row["avg_cost"] is None else None)
             set_cell(self.table, index, 5, fmt_price(row["price"]), align="right")
-            set_cell(self.table, index, 6, fmt_pct(row["day"]), align="right", color=pnl_color(pnl_kind(row["day"])))
-            set_cell(self.table, index, 7, fmt_cny(row["cny"]), align="right")
-            set_cell(self.table, index, 8, fmt_cny(row["pnl_cny"]), align="right", color=pnl_color(pnl_kind(row["pnl_cny"])))
-            set_cell(self.table, index, 9, row["source"] or "—")
+            set_cell(self.table, index, 6, fmt_pct(row["ret"]), align="right", color=pnl_color(pnl_kind(row["ret"])))
+            set_cell(self.table, index, 7, fmt_cny(row["cost_cny"]), align="right")
+            set_cell(self.table, index, 8, fmt_cny(row["cny"]), align="right")
+            set_cell(self.table, index, 9, fmt_cny(row["pnl_cny"]), align="right", color=pnl_color(pnl_kind(row["pnl_cny"])))
+            set_cell(self.table, index, 10, fmt_pct(row["weight"]), align="right")
+            source = row["source"] or "—"
+            if row["quoted_at"]:
+                source = f"{source} · {row['quoted_at']}"
+            set_cell(self.table, index, 11, source)
         restore(self.table, current)
+        totals = db.holdings_totals(rows)
+        if rows:
+            text = f"市值 {fmt_cny(totals['value'])} · 成本 {fmt_cny(totals['cost'])} · 浮盈 {fmt_signed(totals['pnl'])}"
+            if totals["ret"] is not None:
+                text += f"（{fmt_pct(totals['ret'])}）"
+            if totals["without_cost"]:
+                text += f" · {totals['without_cost']} 笔未填成本，不计入收益"
+            self.holding_summary.setText(text)
+        else:
+            self.holding_summary.setText("")
         plan_id = selected_id(self.plans)
         record_id = selected_id(self.records)
         plans, _total, _unpriced = db.dca_plan_rows()
@@ -738,54 +767,182 @@ class ExpensesPage(Page):
     def __init__(self):
         super().__init__(
             "支出",
-            "支出按人民币登记，用来和年度预算对照。默认看本月。可以手工记，也可以把导入的账户明细归类成支出；退款会冲减对应类别。",
+            "支出按人民币登记，用来和年度预算对照。可以手工记，也可以把导入的账户明细归类成支出；退款会冲减对应类别。"
+            "点「分类构成」里的一类只看这一类，点右边的柱子切换到那个月。",
         )
-        self.month_box = QComboBox()
-        self.month_box.addItem("全部月份", None)
+        self.category_filter = None
+        self.period_box = QComboBox()
+        self.period_box.setMinimumWidth(130)
+        today = date.today()
+        self.period_box.addItem("全部月份", None)
+        for year in (today.year, today.year - 1):
+            self.period_box.addItem(f"{year} 全年", f"{year:04d}")
         for year, month in reversed(db.recent_months(24)):
             key = f"{year:04d}-{month:02d}"
-            self.month_box.addItem(key, key)
-        current = self.month_box.findData(date.today().strftime("%Y-%m"))
-        if current >= 0:
-            self.month_box.setCurrentIndex(current)
-        self.month_box.currentIndexChanged.connect(lambda *_: self.reload())
-        self.toolbar.addWidget(self.month_box)
+            self.period_box.addItem(f"{year} 年 {month} 月", key)
+        self.period_box.setCurrentIndex(max(self.period_box.findData(today.strftime("%Y-%m")), 0))
+        self.period_box.currentIndexChanged.connect(self._period_changed)
+        self.toolbar.addWidget(self.period_box)
         self.add_action("记一笔", self.add_expense, "primary")
         self.add_action("编辑", self.edit_expense)
         self.add_action("删除", self.delete_expense, "danger")
         self.add_action("新类别", self.add_category)
         self.toolbar.addSpacing(18)
         self.classify_btn = self.add_action("归类明细", self.open_classify, "primary")
-        self.total_label = QLabel("")
-        self.total_label.setObjectName("TopMeta")
-        self.toolbar.addWidget(self.total_label)
         self.toolbar.addStretch(1)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        self.cards = {}
+        for key, label in (("total", "本期支出"), ("change", "比上期"), ("top", "最多的一类"), ("budget", "本期预算")):
+            card = MetricCard(label)
+            card.setMinimumHeight(96)
+            self.cards[key] = card
+            cards.addWidget(card, 1)
+        self.root.addLayout(cards)
+
+        charts = QHBoxLayout()
+        charts.setSpacing(12)
+        mix = Panel("分类构成")
+        self.category_bars = CategoryBars()
+        self.category_bars.picked.connect(self._category_picked)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.setWidget(self.category_bars)
+        mix.body.addWidget(scroll)
+        trend = Panel("近六个月 · 按类别")
+        self.months = StackedMonths()
+        self.months.picked.connect(self._month_picked)
+        trend.body.addWidget(self.months)
+        for panel in (mix, trend):
+            panel.setFixedHeight(270)
+        charts.addWidget(mix, 5)
+        charts.addWidget(trend, 4)
+        self.root.addLayout(charts)
+
+        filter_bar = QHBoxLayout()
+        self.filter_label = QLabel("")
+        self.filter_label.setObjectName("Figure")
+        self.clear_filter = QPushButton("显示全部类别")
+        self.clear_filter.setObjectName("GhostButton")
+        self.clear_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_filter.clicked.connect(lambda: self._category_picked(None))
+        filter_bar.addWidget(self.filter_label)
+        filter_bar.addWidget(self.clear_filter)
+        filter_bar.addStretch(1)
+        self.root.addLayout(filter_bar)
+
         self.table = make_table(["日期", "类别", "金额", "对象", "来源", "备注"])
+        self.table.setMinimumHeight(180)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit_expense())
         self.root.addWidget(self.table, 1)
 
-    def _visible(self):
-        key = self.month_box.currentData()
-        rows = db.list_expenses()
-        if key:
-            rows = [row for row in rows if row["occurred_on"].startswith(key)]
-        return rows
+    def _period(self):
+        return self.period_box.currentData()
+
+    def _period_changed(self, *_args):
+        self.category_filter = None
+        self.reload()
+
+    def _category_picked(self, category_id):
+        self.category_filter = category_id
+        self.reload()
+
+    def _month_picked(self, key):
+        index = self.period_box.findData(key)
+        if index >= 0 and index != self.period_box.currentIndex():
+            self.period_box.setCurrentIndex(index)
+
+    @staticmethod
+    def _days(period):
+        today = date.today()
+        if not period:
+            return None
+        if len(period) == 4:
+            year = int(period)
+            end = today if year == today.year else date(year, 12, 31)
+            return (end - date(year, 1, 1)).days + 1
+        year, month = int(period[:4]), int(period[5:7])
+        if (year, month) == (today.year, today.month):
+            return today.day
+        nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        return (nxt - date(year, month, 1)).days
 
     def reload(self):
         current = selected_id(self.table)
-        rows = self._visible()
+        period = self._period()
+        expenses = db.list_expenses()
+        categories = db.list_categories()
+        colors = category_colors([row["name"] for row in categories])
+        groups = spending.by_category(expenses, period)
+        if self.category_filter not in {row["category_id"] for row in groups}:
+            self.category_filter = None
+        year = int(period[:4]) if period else date.today().year
+        budgets = spending.budget_for(period, db.budget_progress(year))
+        self.category_bars.set_rows(groups, colors, budgets, self.category_filter)
+        keys, names, cells = spending.monthly_stack(expenses, 6)
+        self.months.set_data(keys, names, cells, colors, period if period and len(period) == 7 else None)
+        self._fill_cards(expenses, groups, budgets, period)
+
+        rows = [row for row in expenses if spending.in_period(row, period)]
+        if self.category_filter is not None:
+            rows = [row for row in rows if row["category_id"] == self.category_filter]
+            name = next(row["category"] for row in groups if row["category_id"] == self.category_filter)
+            self.filter_label.setText(f"只看「{name}」 · {len(rows)} 笔 · 合计 {fmt_cny(sum(row['amount'] for row in rows))}")
+            self.clear_filter.setVisible(True)
+        else:
+            self.filter_label.setText(f"{spending.period_label(period)} · {len(rows)} 笔明细")
+            self.clear_filter.setVisible(False)
         self.table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             set_cell(self.table, index, 0, row["occurred_on"], row["id"])
-            set_cell(self.table, index, 1, row["category"])
+            set_cell(self.table, index, 1, row["category"], color=colors.get(row["category"]))
             set_cell(self.table, index, 2, fmt_cny(row["amount"]), align="right", color=DOWN if row["amount"] < 0 else None)
             set_cell(self.table, index, 3, row["payee"])
             set_cell(self.table, index, 4, self._source(row), color=GOLD if row.get("txn_id") else None)
             set_cell(self.table, index, 5, row["note"])
-        self.total_label.setText(f"    合计 {fmt_cny(sum(row['amount'] for row in rows))}")
         restore(self.table, current)
         waiting = db.pending_count()
         self.classify_btn.setText(f"归类明细（{waiting} 笔待归类）" if waiting else "归类明细")
+
+    def _fill_cards(self, expenses, groups, budgets, period):
+        amount = spending.total(expenses, period)
+        count = sum(row["count"] for row in groups)
+        days = self._days(period)
+        note = f"{count} 笔" + (f" · 日均 {fmt_cny(amount / days)}" if days else "")
+        self.cards["total"].set_value(fmt_cny(amount), note)
+
+        before = spending.previous_period(period)
+        if before is None:
+            self.cards["change"].set_value("—", "选一个月或一年才能和上期比较")
+        else:
+            last = spending.total(expenses, before)
+            if last:
+                change = (amount - last) / last
+                self.cards["change"].set_value(f"{'+' if change > 0 else ''}{change * 100:.1f}%", f"{spending.period_label(before)} {fmt_cny(last)}")
+            else:
+                self.cards["change"].set_value("—", f"{spending.period_label(before)} 没有支出")
+
+        top = groups[0] if groups and groups[0]["amount"] > 0 else None
+        if top:
+            self.cards["top"].set_value(top["category"], f"{fmt_cny(top['amount'])} · 占 {top['share'] * 100:.0f}%")
+        else:
+            self.cards["top"].set_value("—", "")
+
+        planned = sum(budgets.values())
+        if not period:
+            self.cards["budget"].set_value("—", "选一个月或一年才能对照预算")
+        elif not planned:
+            self.cards["budget"].set_value("未设置", "在「预算」页按类别设置年度预算")
+        else:
+            spent = sum(row["amount"] for row in groups if row["category_id"] in budgets)
+            over = [row["category"] for row in groups if row["category_id"] in budgets and row["amount"] > budgets[row["category_id"]]]
+            scope = "按年度预算的十二分之一" if len(period) == 7 else "全年预算"
+            note = f"{scope} {fmt_cny(planned)}" + (f" · 超出：{'、'.join(over[:3])}" if over else "")
+            self.cards["budget"].set_value(f"已用 {spent / planned * 100:.0f}%", note)
 
     @staticmethod
     def _source(row):

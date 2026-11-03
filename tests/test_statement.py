@@ -125,6 +125,27 @@ class StatementTest(unittest.TestCase):
         db.import_txns(self.account, result["rows"], mapping, "支付宝")
         self.assertEqual(db.latest_balance(self.account)["balance"], 1465)
 
+    def test_manual_balance_anchors_transactions_without_balance(self):
+        rows = [
+            {"txn_date": "2026-10-28", "txn_time": "", "amount": -10, "balance": None,
+             "counterparty": "", "summary": "", "note": "", "fingerprint": "a" * 24},
+            {"txn_date": "2026-10-31", "txn_time": "", "amount": -5, "balance": None,
+             "counterparty": "", "summary": "", "note": "", "fingerprint": "b" * 24},
+            {"txn_date": "2026-11-01", "txn_time": "", "amount": -2, "balance": None,
+             "counterparty": "", "summary": "", "note": "", "fingerprint": "c" * 24},
+        ]
+        db.import_txns(self.account, rows, {"opening": 0}, "卡")
+        self.assertEqual(db.latest_balance(self.account)["balance"], -17)
+        entry = db.save_balance({"account_id": self.account, "as_of_date": "2026-11-02", "balance": -1000, "note": "账单"})
+        self.assertEqual(db.latest_balance(self.account)["as_of_date"], "2026-11-02")
+        db.save_balance({"account_id": self.account, "as_of_date": "2026-10-27", "balance": -1000, "note": "账单"}, entry)
+        self.assertEqual(
+            [(row["as_of_date"], row["balance"], row["source"]) for row in reversed(db.list_balances(self.account))],
+            [("2026-10-27", -1000, "手工"), ("2026-10-31", -1015, "明细"), ("2026-11-01", -1017, "明细")],
+        )
+        db.delete_balance(entry)
+        self.assertEqual(db.latest_balance(self.account)["balance"], -17)
+
     def test_debit_credit_flag_and_invert_hint(self):
         wb = Workbook()
         ws = wb.active

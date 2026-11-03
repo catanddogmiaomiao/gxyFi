@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +20,27 @@ GOLD = QColor("#C6A15B")
 INK = QColor("#8C9BAB")
 BRONZE = QColor("#8A7044")
 MUTED = QColor("#8C877C")
+SELECTED = QColor("#2A2418")
+TRACK = QColor("#1C222C")
+BRIGHT = QColor("#F4E7C6")
+
+CATEGORY_COLORS = [
+    QColor("#C6A15B"), QColor("#8C9BAB"), QColor("#7F9E93"), QColor("#C4786A"), QColor("#9A86A6"),
+    QColor("#D8C79E"), QColor("#5F8A8B"), QColor("#A0695A"), QColor("#8A7044"), QColor("#6F7F95"),
+]
+
+
+def category_colors(names):
+    """按类别的固定顺序分配颜色，同一类别在各个图里颜色一致。"""
+    colors = {name: CATEGORY_COLORS[index % len(CATEGORY_COLORS)] for index, name in enumerate(names)}
+    colors.setdefault("其他类别", MUTED)
+    return colors
+
+
+def _font(size=9, bold=False):
+    font = QFont("Microsoft YaHei UI", size)
+    font.setBold(bold)
+    return font
 
 
 def pnl_color(kind):
@@ -187,37 +208,169 @@ class MixBar(QWidget):
         painter.drawText(self.rect().adjusted(0, 36, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, legend)
 
 
-class MonthBars(QWidget):
+class CategoryBars(QWidget):
+    """每个类别一行：名称、占比条、金额与占比。有预算时在条上画出预算线。点一行选中，再点取消。"""
+
+    picked = pyqtSignal(object)
+    ROW = 34
+
     def __init__(self):
         super().__init__()
         self._rows = []
-        self.setMinimumHeight(180)
+        self._colors = {}
+        self._budgets = {}
+        self._selected = None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def set_rows(self, rows):
+    def set_rows(self, rows, colors, budgets=None, selected=None):
         self._rows = rows
+        self._colors = colors
+        self._budgets = budgets or {}
+        self._selected = selected
+        self.setMinimumHeight(max(len(rows) * self.ROW + 8, 120))
         self.update()
+
+    def mousePressEvent(self, event):
+        index = int(event.position().y() // self.ROW)
+        if 0 <= index < len(self._rows):
+            category_id = self._rows[index]["category_id"]
+            self._selected = None if self._selected == category_id else category_id
+            self.update()
+            self.picked.emit(self._selected)
 
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if not self._rows or all(value <= 0 for _label, value in self._rows):
+        if not self._rows:
             painter.setPen(MUTED)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "近几个月还没有支出")
+            painter.setFont(_font())
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "这一期还没有支出。可以手工记一笔，或把导入的明细归类。")
             return
-        peak = max(value for _label, value in self._rows) or 1
-        count = len(self._rows)
-        gap = 16
-        width = max((self.width() - gap * (count + 1)) / count, 8)
-        base = self.height() - 28
-        top = 12
-        for index, (label, value) in enumerate(self._rows):
-            height = 0 if peak == 0 else (base - top) * value / peak
-            x = gap + index * (width + gap)
+        name_w, text_w = 76, 190
+        bar_left = name_w + 8
+        bar_w = max(self.width() - bar_left - text_w - 12, 40)
+        scale = max(max(row["amount"] for row in self._rows), max(self._budgets.values(), default=0), 1)
+        for index, row in enumerate(self._rows):
+            top = index * self.ROW
+            if row["category_id"] == self._selected:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(SELECTED)
+                painter.drawRoundedRect(QRectF(0, top + 2, self.width(), self.ROW - 4), 4, 4)
+            color = self._colors.get(row["category"], GOLD)
+            painter.setPen(BRIGHT)
+            painter.setFont(_font(10))
+            painter.drawText(QRectF(8, top, name_w, self.ROW), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, row["category"])
+            bar_top = top + self.ROW / 2 - 6
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(GOLD)
-            painter.drawRoundedRect(int(x), int(base - height), int(width), max(int(height), 2), 3, 3)
+            painter.setBrush(TRACK)
+            painter.drawRoundedRect(QRectF(bar_left, bar_top, bar_w, 12), 3, 3)
+            width = bar_w * max(row["amount"], 0) / scale
+            if width > 0:
+                painter.setBrush(color)
+                painter.drawRoundedRect(QRectF(bar_left, bar_top, max(width, 3), 12), 3, 3)
+            budget = self._budgets.get(row["category_id"])
+            over = False
+            if budget:
+                x = bar_left + bar_w * budget / scale
+                over = row["amount"] > budget
+                painter.setPen(QPen(UP if over else BRIGHT, 2))
+                painter.drawLine(int(x), int(bar_top - 4), int(x), int(bar_top + 16))
+            text = f"{row['amount']:,.2f}   {row['share'] * 100:.0f}%"
+            painter.setPen(UP if over else BRIGHT)
+            painter.setFont(_font(10))
+            painter.drawText(
+                QRectF(self.width() - text_w - 4, top, text_w, self.ROW / 2 + 4),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, text,
+            )
+            detail = f"{row['count']} 笔"
+            if row["refund"]:
+                detail += f" · 含退款 {row['refund']:,.2f}"
+            if budget:
+                detail += f" · 预算 {row['amount'] / budget * 100:.0f}%"
             painter.setPen(MUTED)
-            painter.drawText(int(x - 8), base + 4, int(width + 16), 20, Qt.AlignmentFlag.AlignCenter, label[2:])
-            painter.setPen(QPen(QColor("#F4E7C6")))
-            if value > 0:
-                painter.drawText(int(x - 12), int(base - height) - 18, int(width + 24), 16, Qt.AlignmentFlag.AlignCenter, f"{value:,.0f}")
+            painter.setFont(_font(8))
+            painter.drawText(
+                QRectF(self.width() - text_w - 4, top + self.ROW / 2 + 2, text_w, self.ROW / 2 - 2),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, detail,
+            )
+
+
+class StackedMonths(QWidget):
+    """近几个月的支出，每月一根柱子，按类别分段。点柱子发出那个月份。"""
+
+    picked = pyqtSignal(str)
+
+    def __init__(self, empty_text="近几个月还没有支出"):
+        super().__init__()
+        self._keys, self._names, self._cells = [], [], {}
+        self._colors = {}
+        self._current = None
+        self._empty = empty_text
+        self.setMinimumHeight(200)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, keys, names, cells, colors, current=None):
+        self._keys, self._names, self._cells = keys, names, cells
+        self._colors = colors
+        self._current = current
+        self.update()
+
+    def _slots(self):
+        count = max(len(self._keys), 1)
+        gap = 18
+        width = max((self.width() - gap * (count + 1)) / count, 10)
+        return gap, width
+
+    def mousePressEvent(self, event):
+        gap, width = self._slots()
+        index = int((event.position().x() - gap / 2) // (width + gap))
+        if 0 <= index < len(self._keys):
+            self.picked.emit(self._keys[index])
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        totals = [sum(self._cells.get(key, {}).values()) for key in self._keys]
+        if not self._keys or not any(totals):
+            painter.setPen(MUTED)
+            painter.setFont(_font())
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._empty)
+            return
+        painter.setFont(_font(8))
+        x = 0.0
+        for name in self._names:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._colors.get(name, MUTED))
+            painter.drawRoundedRect(QRectF(x, 5, 9, 9), 2, 2)
+            painter.setPen(MUTED)
+            label_w = painter.fontMetrics().horizontalAdvance(name) + 16
+            painter.drawText(QRectF(x + 13, 0, label_w, 20), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+            x += label_w + 13
+        gap, width = self._slots()
+        base = self.height() - 26
+        top = 44
+        peak = max(totals) or 1
+        for index, key in enumerate(self._keys):
+            left = gap + index * (width + gap)
+            if key == self._current:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(SELECTED)
+                painter.drawRoundedRect(QRectF(left - 6, top - 20, width + 12, base - top + 46), 4, 4)
+            y = base
+            cells = self._cells.get(key, {})
+            for name in self._names:
+                value = cells.get(name, 0)
+                if value <= 0:
+                    continue
+                height = (base - top) * value / peak
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self._colors.get(name, MUTED))
+                painter.drawRect(QRectF(left, y - height, width, max(height, 1)))
+                y -= height
+            painter.setPen(MUTED)
+            painter.setFont(_font(9))
+            painter.drawText(QRectF(left - 10, base + 4, width + 20, 20), Qt.AlignmentFlag.AlignCenter, f"{int(key[5:7])} 月")
+            if totals[index] > 0:
+                painter.setPen(BRIGHT)
+                painter.drawText(QRectF(left - 16, y - 19, width + 32, 16), Qt.AlignmentFlag.AlignCenter, f"{totals[index]:,.0f}")
