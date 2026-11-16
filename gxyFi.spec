@@ -34,6 +34,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon="assets/gxyfi.ico",
+    version="installer/version_info.txt",
 )
 coll = COLLECT(
     exe,

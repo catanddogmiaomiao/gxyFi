@@ -100,12 +100,13 @@ def rule_for(txn, treat, category_id):
 
 def suggest(rows, rules, manual_expenses, categories, history):
     """返回 {明细 id: 建议}。建议含 treat、category_id、expense_id、reason、merge。"""
-    by_name = {row["name"]: row["id"] for row in categories}
+    active_ids = {row["id"] for row in categories if row.get("active", 1)}
+    by_name = {row["name"]: row["id"] for row in categories if row["id"] in active_ids}
     names = {row["id"]: row["name"] for row in categories}
     learned = {}
     for row in sorted(history, key=lambda item: item["txn_date"]):
         key = (row.get("counterparty") or "").strip()
-        if key and row.get("category_id") and row.get("treat") in ("支出", "退款"):
+        if key and row.get("category_id") in active_ids and row.get("treat") in ("支出", "退款"):
             learned[key] = row["category_id"]
     open_manual = [row for row in manual_expenses if not row.get("txn_id") and (row.get("source") or "手工") == "手工"]
     used = set()
@@ -126,6 +127,8 @@ def suggest(rows, rules, manual_expenses, categories, history):
                 }
                 continue
         rule = match_rule(txn, rules)
+        if rule is not None and rule["treat"] != "不计" and rule.get("category_id") not in active_ids:
+            rule = None
         if rule is not None:
             treat = rule["treat"]
             if (treat == "支出" and txn["amount"] < 0) or (treat == "退款" and txn["amount"] > 0) or treat == "不计":
@@ -136,7 +139,7 @@ def suggest(rows, rules, manual_expenses, categories, history):
                 continue
         counterparty = (txn.get("counterparty") or "").strip()
         treat = "退款" if txn["amount"] > 0 else "支出"
-        if counterparty in learned and learned[counterparty] in names:
+        if counterparty in learned and learned[counterparty] in active_ids:
             out[txn["id"]] = {
                 "treat": treat, "category_id": learned[counterparty], "expense_id": None, "merge": False,
                 "reason": f"「{counterparty}」以前归为这一类",

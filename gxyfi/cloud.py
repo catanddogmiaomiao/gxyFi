@@ -17,7 +17,7 @@ from http.cookies import SimpleCookie
 
 from gxyfi import db, dca
 
-DEFAULT_URL = "https://gxyfi-web.catanddogmiaomiao.workers.dev"
+DEFAULT_URL = "https://gxyfi.top"
 USER_AGENT = "gxyFi-desktop/0.2 (Windows)"
 TIMEOUT = 30
 WRITES = 0
@@ -49,6 +49,29 @@ def enabled():
 
 def expired():
     return enabled() and not db.get_setting("cloud_token")
+
+
+def change_server(text):
+    """把网页端地址改到新网址，并用当前登录试一次同步。
+
+    返回 ("same" | "ok" | "relogin", 规范化后的地址)。
+    新地址连不上时保留原来的地址。新地址不认当前登录时，地址改过去并要求重新登录。
+    """
+    url = server_url(text)
+    previous = config()["url"]
+    if url == previous:
+        return "same", url
+    db.set_setting("cloud_url", url)
+    try:
+        state = fetch_state()
+    except AuthExpired:
+        mark_expired()
+        return "relogin", url
+    except CloudError:
+        db.set_setting("cloud_url", previous)
+        raise
+    apply(state)
+    return "ok", url
 
 
 def server_url(text):
@@ -263,7 +286,7 @@ def delete_holding(holding_id):
     mutate("holding", "delete", record_id=holding_id)
 
 
-PLAN_KEYS = ("name", "symbol", "amount", "cycle", "debit_day", "status", "started_on", "manual_nav", "note")
+PLAN_KEYS = ("name", "symbol", "amount", "cycle", "debit_day", "status", "started_on", "manual_nav", "note", "stopped_on", "stop_reason")
 RECORD_KEYS = ("plan_id", "kind", "trade_date", "amount", "nav", "shares", "fee", "note")
 
 
@@ -274,6 +297,10 @@ def save_dca_plan(data, plan_id=None):
 
 def delete_dca_plan(plan_id):
     mutate("dca_plan", "delete", record_id=plan_id)
+
+
+def set_dca_status(plan_id, status, stopped_on=None, reason=""):
+    mutate("dca_plan_status", "update", {"status": status, "stopped_on": stopped_on, "stop_reason": reason}, plan_id)
 
 
 def save_dca_record(data, record_id=None):
@@ -327,8 +354,18 @@ def delete_property(property_id):
     mutate("property", "delete", record_id=property_id)
 
 
-def save_category(name):
+def save_category(name, category_id=None):
+    if category_id:
+        return mutate("category", "update", {"name": name}, category_id, "expense_categories")
     return mutate("category", "create", {"name": name}, None, "expense_categories")
+
+
+def set_category_active(category_id, active):
+    mutate("category", "update", {"active": 1 if active else 0}, category_id, "expense_categories")
+
+
+def move_category(source_id, target_id):
+    mutate("category_move", "update", {"target_id": int(target_id)}, source_id)
 
 
 def save_expense(data, expense_id=None):

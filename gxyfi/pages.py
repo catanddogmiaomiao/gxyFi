@@ -28,14 +28,16 @@ from gxyfi.dialogs import (
     edit_account,
     edit_balance,
     edit_budget,
-    edit_category,
     edit_dca_plan,
     edit_dca_record,
     edit_expense,
     edit_fx,
     edit_holding,
     edit_property,
+    manage_categories,
 )
+from gxyfi.dialogs import stop_dca_plan as stop_dca_dialog
+from gxyfi.dca import STOPPED
 from gxyfi.formatutil import fmt_cny, fmt_money, fmt_pct, fmt_price, fmt_signed, pnl_kind
 from gxyfi.market import fetch_one, prepare_holding
 from gxyfi.classify import describe as describe_treat
@@ -458,6 +460,7 @@ class HoldingsPage(Page):
         for text, slot, kind in (
             ("新增计划", self.add_plan, "primary"),
             ("编辑计划", self.edit_plan, "ghost"),
+            ("停止定投", self.toggle_plan, "ghost"),
             ("删除计划", self.delete_plan, "danger"),
             ("记一笔", self.add_record, "primary"),
             ("编辑记录", self.edit_record, "ghost"),
@@ -470,6 +473,8 @@ class HoldingsPage(Page):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(slot)
             dca_bar.addWidget(button)
+            if slot == self.toggle_plan:
+                self.toggle_btn = button
         dca_bar.addStretch(1)
         dca_layout.addLayout(dca_bar)
         self.plans = make_table(["基金", "代码", "每期", "周期", "状态", "份额", "成本", "净值", "市值¥", "浮盈¥"])
@@ -496,6 +501,42 @@ class HoldingsPage(Page):
 
     def _show_records(self):
         self._fill_records(None)
+        self._sync_toggle()
+
+    def _sync_toggle(self):
+        plan_id = selected_id(self.plans)
+        plan = next((row for row in db.list_dca_plans() if row["id"] == plan_id), None) if plan_id else None
+        self.toggle_btn.setText("恢复定投" if plan and plan["status"] == STOPPED else "停止定投")
+
+    def toggle_plan(self):
+        plan_id = self._selected_plan()
+        if plan_id is None:
+            return
+        plan = next((row for row in db.list_dca_plans() if row["id"] == plan_id), None)
+        if plan is None:
+            return
+        try:
+            if plan["status"] == STOPPED:
+                box = QMessageBox(self)
+                box.setWindowTitle("恢复定投")
+                box.setText(f"恢复「{plan['name']}」的定投？\n之后可以继续记定投扣款，停止日期和原因会清掉。")
+                box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                box.button(QMessageBox.StandardButton.Yes).setText("恢复")
+                box.button(QMessageBox.StandardButton.No).setText("取消")
+                if box.exec() != QMessageBox.StandardButton.Yes:
+                    return
+                db.resume_dca_plan(plan_id)
+            else:
+                paid = [row["trade_date"] for row in db.list_dca_records(plan_id) if row["kind"] == "定投"]
+                data = stop_dca_dialog(self, plan, max(paid) if paid else None)
+                if not data:
+                    return
+                db.stop_dca_plan(plan_id, data["stopped_on"], data["stop_reason"])
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        self.reload()
+        self._sync_toggle()
 
     def _fill_records(self, record_id):
         plan_id = selected_id(self.plans)
@@ -552,8 +593,9 @@ class HoldingsPage(Page):
             set_cell(self.plans, index, 0, row["name"], row["id"])
             set_cell(self.plans, index, 1, row["symbol"])
             set_cell(self.plans, index, 2, fmt_cny(row["amount"]), align="right")
-            set_cell(self.plans, index, 3, row["cycle_label"])
-            set_cell(self.plans, index, 4, row["status"])
+            stopped = row["status"] == STOPPED
+            set_cell(self.plans, index, 3, row["cycle_label"], color=FLAT if stopped else None)
+            set_cell(self.plans, index, 4, row["status_label"], color=FLAT if stopped or row["status"] == "已暂停" else None)
             set_cell(self.plans, index, 5, fmt_price(row["shares"]), align="right")
             set_cell(self.plans, index, 6, fmt_cny(row["cost"]), align="right")
             set_cell(self.plans, index, 7, fmt_price(row["nav"]), align="right")
@@ -562,6 +604,7 @@ class HoldingsPage(Page):
         self.plans.blockSignals(False)
         restore(self.plans, plan_id)
         self._fill_records(record_id)
+        self._sync_toggle()
 
     def add_holding(self):
         self._save_dialog()
@@ -768,7 +811,8 @@ class ExpensesPage(Page):
         super().__init__(
             "支出",
             "支出按人民币登记，用来和年度预算对照。可以手工记，也可以把导入的账户明细归类成支出；退款会冲减对应类别。"
-            "点「分类构成」里的一类只看这一类，点右边的柱子切换到那个月。",
+            "点「分类构成」里的一类只看这一类，点右边的柱子切换到那个月。"
+            "「类别」里可以停用类别，并把过去的支出调整到新类别。",
         )
         self.category_filter = None
         self.period_box = QComboBox()
@@ -786,7 +830,7 @@ class ExpensesPage(Page):
         self.add_action("记一笔", self.add_expense, "primary")
         self.add_action("编辑", self.edit_expense)
         self.add_action("删除", self.delete_expense, "danger")
-        self.add_action("新类别", self.add_category)
+        self.add_action("类别", self.open_categories)
         self.toolbar.addSpacing(18)
         self.classify_btn = self.add_action("归类明细", self.open_classify, "primary")
         self.toolbar.addStretch(1)
@@ -959,7 +1003,7 @@ class ExpensesPage(Page):
             self.reload()
 
     def add_expense(self):
-        data = edit_expense(self, db.list_categories())
+        data = edit_expense(self, db.choosable_categories())
         if data:
             db.save_expense(data)
             self.reload()
@@ -973,7 +1017,7 @@ class ExpensesPage(Page):
         if initial and initial["amount"] < 0:
             QMessageBox.information(self, "这是一笔退款", "退款来自账户明细。要改类别，请在「归类明细 → 已归类」里改；要改金额，请改那笔明细。")
             return
-        data = edit_expense(self, db.list_categories(), initial)
+        data = edit_expense(self, db.choosable_categories(initial["category_id"]), initial)
         if data:
             db.save_expense(data, expense_id)
             self.reload()
@@ -989,16 +1033,9 @@ class ExpensesPage(Page):
             db.delete_expense(expense_id)
             self.reload()
 
-    def add_category(self):
-        name = edit_category(self)
-        if not name:
-            return
-        try:
-            db.save_category(name)
-        except ValueError as exc:
-            QMessageBox.warning(self, "无法保存", str(exc))
-            return
-        self.reload()
+    def open_categories(self):
+        if manage_categories(self):
+            self.reload()
 
 
 class BudgetPage(Page):

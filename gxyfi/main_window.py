@@ -230,7 +230,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self._offline = False
         self._reload()
-        if dialog.changed:
+        if dialog.notice:
+            self._status.showMessage(dialog.notice)
+        elif dialog.changed:
             self._status.showMessage(cloud.config()["user"] and "已切换到网页账号" or "已退出网页账号，这台电脑上的缓存已清空")
 
     def pull_now(self):

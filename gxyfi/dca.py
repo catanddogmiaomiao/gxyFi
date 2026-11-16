@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import date, datetime
 
 CYCLES = ("每月", "每周", "每两周")
-STATUSES = ("进行中", "已暂停", "已结束")
+STOPPED = "已停止"
+STATUSES = ("进行中", "已暂停", STOPPED)
+STATUS_ALIASES = {"已结束": STOPPED, "停止": STOPPED, "已终止": STOPPED}
+STOP_REASONS = ("政策调整", "基金暂停申购", "达到目标", "个人决定", "其他")
 KINDS = ("期初", "定投", "赎回", "红利再投")
 WEEKDAYS = ("", "周一", "周二", "周三", "周四", "周五")
 TEMPLATE_HEADERS = ["确认日期", "类型", "扣款金额", "确认净值", "确认份额", "手续费", "备注"]
@@ -38,6 +41,44 @@ HEADER_MAP = {
     "手续费": "fee",
     "备注": "note",
 }
+
+
+def normalize_status(value):
+    text = str(value or "进行中").strip()
+    text = STATUS_ALIASES.get(text, text)
+    if text not in STATUSES:
+        raise ValueError("状态不正确")
+    return text
+
+
+def check_stop(stopped_on, records):
+    """停止日期不能早于已经记下的最后一笔定投扣款。"""
+    paid = [row["trade_date"] for row in records if row["kind"] == "定投"]
+    if paid and stopped_on < max(paid):
+        raise ValueError(f"停止日期不能早于最后一笔定投（{max(paid)}）")
+
+
+def check_record_allowed(plan, record):
+    """停止后份额继续持有，可以记赎回和红利再投，但不能再记停止日期之后的定投。"""
+    if plan.get("status") != STOPPED or record["kind"] != "定投":
+        return
+    stopped_on = plan.get("stopped_on") or ""
+    if not stopped_on or record["trade_date"] > stopped_on:
+        raise ValueError(
+            f"「{plan.get('name') or plan.get('symbol')}」已在 {stopped_on or '之前'} 停止定投，不能再记之后的定投扣款。"
+            "如果恢复了，请先点「恢复定投」。"
+        )
+
+
+def status_label(plan):
+    if plan.get("status") != STOPPED:
+        return plan.get("status") or ""
+    parts = [STOPPED]
+    if plan.get("stopped_on"):
+        parts.append(plan["stopped_on"])
+    if plan.get("stop_reason"):
+        parts.append(plan["stop_reason"])
+    return " · ".join(parts)
 
 
 def cycle_label(cycle, debit_day):

@@ -166,6 +166,28 @@ class CloudTest(unittest.TestCase):
         self.assertTrue(db.list_categories())
         self.assertEqual(len(self.site.state["accounts"]), 1)
 
+    def test_change_server(self):
+        self.connect()
+        self.assertEqual(cloud.change_server("https://example.test/ignored"), ("same", "https://example.test"))
+        self.assertEqual(cloud.change_server("https://new.example"), ("ok", "https://new.example"))
+        self.assertEqual(cloud.config()["url"], "https://new.example")
+        self.site.token_ok = False
+        self.assertEqual(cloud.change_server("other.example"), ("relogin", "https://other.example"))
+        self.assertTrue(cloud.expired())
+        self.assertEqual(cloud.config()["url"], "https://other.example")
+
+    def test_change_server_keeps_old_url_when_unreachable(self):
+        self.connect()
+
+        def fail(*_args, **_kwargs):
+            raise cloud.CloudError("连不上网站，这次修改没有保存。请检查网络后再试。")
+
+        cloud._request = fail
+        with self.assertRaises(cloud.CloudError):
+            cloud.change_server("https://down.example")
+        self.assertEqual(cloud.config()["url"], "https://example.test")
+        self.assertFalse(cloud.expired())
+
     def test_server_url(self):
         self.assertEqual(cloud.server_url("gxyfi.example.com/abc"), "https://gxyfi.example.com")
         self.assertEqual(cloud.server_url("http://localhost:8787"), "http://localhost:8787")

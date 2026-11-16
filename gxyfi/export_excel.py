@@ -243,7 +243,7 @@ def export_workbook(path):
                 row["symbol"],
                 row["amount"],
                 row["cycle_label"],
-                row["status"],
+                row["status_label"],
                 _as_date(row["started_on"]),
                 row["shares"],
                 row["cost"],

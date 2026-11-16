@@ -136,7 +136,8 @@ class ClassifyDialog(QDialog):
         current = self.category.currentData()
         self.category.clear()
         for row in categories:
-            self.category.addItem(row["name"], row["id"])
+            if row.get("active", 1):
+                self.category.addItem(row["name"], row["id"])
         if current is not None:
             self.category.setCurrentIndex(max(self.category.findData(current), 0))
         rules = db.list_rules()

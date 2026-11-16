@@ -157,6 +157,79 @@ class CoreTest(unittest.TestCase):
         db.delete_account(account)
         self.assertEqual(db.list_balances(account), [])
 
+    def test_category_stop_and_move(self):
+        from gxyfi import classify
+
+        food = next(row for row in db.list_categories() if row["name"] == "餐饮")
+        daily = next(row for row in db.list_categories() if row["name"] == "日用")
+        account = db.save_account({"name": "卡", "institution": "", "kind": "储蓄", "currency": "CNY", "note": ""})
+        db.import_txns(account, [{
+            "txn_date": "2026-10-03", "txn_time": "", "amount": -35, "balance": None,
+            "counterparty": "美团", "summary": "外卖", "note": "", "fingerprint": "food-1",
+        }], None, "a")
+        txn = next(row for row in db.list_txns(account) if row["counterparty"] == "美团")
+        db.classify_txns(
+            [{"id": txn["id"], "treat": "支出", "category_id": food["id"]}],
+            [{"field": "counterparty", "keyword": "美团", "treat": "支出", "category_id": food["id"]}],
+        )
+        db.save_expense({"category_id": food["id"], "occurred_on": "2026-09-02", "amount": 20, "payee": "", "note": ""})
+        db.save_budget(2026, food["id"], 1000, "吃饭")
+        db.save_budget(2026, daily["id"], 500, "日用")
+        db.set_category_active(food["id"], False)
+        self.assertNotIn(food["id"], {row["id"] for row in db.list_categories(active_only=True)})
+        with self.assertRaises(ValueError):
+            db.save_expense({"category_id": food["id"], "occurred_on": "2026-11-01", "amount": 10, "payee": "", "note": ""})
+        db.import_txns(account, [{
+            "txn_date": "2026-11-03", "txn_time": "", "amount": -18, "balance": None,
+            "counterparty": "美团", "summary": "外卖", "note": "", "fingerprint": "food-2",
+        }], None, "b")
+        pending = [row for row in db.list_txns(account) if not row["treat"]]
+        hints = classify.suggest(pending, db.list_rules(), [], db.list_categories(), [])
+        self.assertTrue(all(hint.get("category_id") != food["id"] for hint in hints.values()))
+        self.assertEqual(db.move_category(food["id"], daily["id"]), 2)
+        self.assertTrue(all(row["category_id"] != food["id"] for row in db.list_expenses()))
+        self.assertEqual(db._one("SELECT category_id FROM account_txns WHERE id=?", (txn["id"],))["category_id"], daily["id"])
+        self.assertEqual(db._one("SELECT category_id FROM txn_rules WHERE keyword='美团'")["category_id"], daily["id"])
+        progress = {row["category"]: row for row in db.budget_progress(2026)}
+        self.assertNotIn("餐饮", progress)
+        self.assertEqual(progress["日用"]["planned"], 1500)
+        self.assertIn("吃饭", progress["日用"]["note"])
+        self.assertTrue(any(row["id"] == food["id"] and not row["active"] for row in db.list_categories()))
+        with self.assertRaises(ValueError):
+            db.move_category(daily["id"], daily["id"])
+        with self.assertRaises(ValueError):
+            db.save_category("日用")
+        db.save_category("茶饮", food["id"])
+        self.assertEqual(db._one("SELECT name FROM expense_categories WHERE id=?", (food["id"],))["name"], "茶饮")
+        active_ids = [row["id"] for row in db.list_categories(active_only=True)]
+        for category_id in active_ids[:-1]:
+            db.set_category_active(category_id, False)
+        with self.assertRaises(ValueError):
+            db.set_category_active(active_ids[-1], False)
+
+    def test_dca_stop(self):
+        plan = db.save_dca_plan(
+            {"name": "中证红利", "symbol": "100032", "amount": 300, "cycle": "每月", "debit_day": 8,
+             "status": "进行中", "started_on": "2025-01-08", "manual_nav": 1.2, "note": ""}
+        )
+        db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-05-08", "amount": 300, "nav": 1, "shares": None, "note": ""})
+        with self.assertRaises(ValueError):
+            db.stop_dca_plan(plan, "2026-05-01", "政策调整")
+        db.stop_dca_plan(plan, "2026-06-01", "政策调整：暂停大额申购")
+        row = db.dca_plan_rows()[0][0]
+        self.assertEqual(row["status"], "已停止")
+        self.assertEqual(row["cycle_label"], "不再扣款")
+        self.assertIn("2026-06-01", row["status_label"])
+        self.assertEqual(row["market_value"], 360)
+        with self.assertRaises(ValueError):
+            db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-06-08", "amount": 300, "nav": 1, "shares": None, "note": ""})
+        db.save_dca_record({"plan_id": plan, "kind": "赎回", "trade_date": "2026-07-01", "amount": 120, "shares": 100, "nav": 1.2, "note": ""})
+        db.resume_dca_plan(plan)
+        db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-08-08", "amount": 300, "nav": 1, "shares": None, "note": ""})
+        resumed = db.list_dca_plans()[0]
+        self.assertEqual(resumed["status"], "进行中")
+        self.assertIsNone(resumed["stopped_on"])
+
     def test_dca(self):
         plan = db.save_dca_plan(
             {

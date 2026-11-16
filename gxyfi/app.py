@@ -52,7 +52,21 @@ def install_error_box():
     sys.excepthook = show
 
 
+def windows_identity():
+    """让开始菜单、任务栏和安装程序把这个进程认成同一个 gxyFi。"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gxyFi.Desktop")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    windows_identity.handle = kernel32.CreateMutexW(None, False, "gxyFi.Desktop")
+
+
 def main():
+    windows_identity()
     db.init_db()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

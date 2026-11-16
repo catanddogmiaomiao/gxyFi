@@ -166,6 +166,9 @@ ADDED_COLUMNS = (
     ("account_txns", "category_id", "INTEGER"),
     ("expenses", "txn_id", "INTEGER"),
     ("expenses", "source", "TEXT NOT NULL DEFAULT '手工'"),
+    ("dca_plans", "stopped_on", "TEXT"),
+    ("dca_plans", "stop_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("expense_categories", "active", "INTEGER NOT NULL DEFAULT 1"),
 )
 TXN_COLUMNS = (
     "id", "account_id", "txn_date", "txn_time", "amount", "balance", "counterparty",
@@ -230,6 +233,7 @@ def init_db():
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+        conn.execute("UPDATE dca_plans SET status=? WHERE status='已结束'", (dca.STOPPED,))
         count = conn.execute("SELECT COUNT(*) AS n FROM expense_categories").fetchone()["n"]
         if count == 0:
             conn.executemany(
@@ -738,7 +742,7 @@ def classify_txns(items, rules=()):
         return remote.classify_txns(items, rules)
     stamp = now_text()
     with connect() as conn:
-        categories = {row["id"] for row in conn.execute("SELECT id FROM expense_categories")}
+        active = {row["id"] for row in conn.execute("SELECT id FROM expense_categories WHERE active=1")}
         used = set()
         for item in items:
             treat = item.get("treat") or ""
@@ -764,8 +768,8 @@ def classify_txns(items, rules=()):
                 conn.execute("UPDATE expenses SET txn_id=? WHERE id=?", (txn["id"], merge_id))
             elif treat in ("支出", "退款"):
                 category_id = int(item.get("category_id") or 0)
-                if category_id not in categories:
-                    raise ValueError("请选择支出类别")
+                if category_id not in active:
+                    raise ValueError("这个类别已停用，请改到在用的类别")
                 payload = _expense_payload(txn, treat)
                 conn.execute(
                     """
@@ -784,7 +788,7 @@ def classify_txns(items, rules=()):
             if rule.get("field") not in ("counterparty", "summary") or not keyword or treat not in ("支出", "退款", "不计"):
                 continue
             category_id = None if treat == "不计" else rule.get("category_id")
-            if treat != "不计" and category_id not in categories:
+            if treat != "不计" and category_id not in active:
                 continue
             conn.execute(
                 """
@@ -909,7 +913,12 @@ def delete_holding(holding_id):
 
 
 def list_dca_plans():
-    return _all("SELECT * FROM dca_plans ORDER BY status, symbol, id")
+    return _all(
+        """
+        SELECT * FROM dca_plans
+        ORDER BY CASE status WHEN '进行中' THEN 0 WHEN '已暂停' THEN 1 ELSE 2 END, symbol, id
+        """
+    )
 
 
 def list_dca_records(plan_id=None):
@@ -952,13 +961,15 @@ def save_dca_plan(data, plan_id=None):
     limit = 28 if cycle == "每月" else 5
     if debit_day < 1 or debit_day > limit:
         raise ValueError("扣款日不在可选范围内")
-    status = data.get("status") or "进行中"
-    if status not in dca.STATUSES:
-        raise ValueError("状态不正确")
+    status = dca.normalize_status(data.get("status"))
     started_on = data.get("started_on") or None
     manual_nav = r4(data.get("manual_nav"))
     if manual_nav is not None and manual_nav <= 0:
         raise ValueError("最新净值需要大于 0")
+    stopped_on, reason = None, ""
+    if status == dca.STOPPED:
+        stopped_on = data.get("stopped_on") or date.today().isoformat()
+        reason = str(data.get("stop_reason") or "").strip()[:80]
     fields = (
         name,
         symbol,
@@ -969,6 +980,8 @@ def save_dca_plan(data, plan_id=None):
         started_on,
         manual_nav,
         str(data.get("note") or "").strip(),
+        stopped_on,
+        reason,
     )
     with connect() as conn:
         if plan_id:
@@ -978,7 +991,7 @@ def save_dca_plan(data, plan_id=None):
                 """
                 UPDATE dca_plans
                 SET name=?, symbol=?, amount=?, cycle=?, debit_day=?, status=?,
-                    started_on=?, manual_nav=?, note=?
+                    started_on=?, manual_nav=?, note=?, stopped_on=?, stop_reason=?
                 WHERE id=?
                 """,
                 (*fields, plan_id),
@@ -987,12 +1000,34 @@ def save_dca_plan(data, plan_id=None):
         cur = conn.execute(
             """
             INSERT INTO dca_plans(
-                name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                name, symbol, amount, cycle, debit_day, status, started_on, manual_nav, note,
+                stopped_on, stop_reason, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (*fields, now_text()),
         )
         return cur.lastrowid
+
+
+def stop_dca_plan(plan_id, stopped_on, reason=""):
+    """停止定投：之后不再扣款，已有份额继续持有、继续估值。"""
+    if remote := _remote():
+        return remote.set_dca_status(plan_id, dca.STOPPED, stopped_on, reason)
+    _plan_or_raise(plan_id)
+    dca.check_stop(stopped_on, list_dca_records(plan_id))
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dca_plans SET status=?, stopped_on=?, stop_reason=? WHERE id=?",
+            (dca.STOPPED, stopped_on, str(reason or "").strip()[:80], plan_id),
+        )
+
+
+def resume_dca_plan(plan_id):
+    if remote := _remote():
+        return remote.set_dca_status(plan_id, "进行中", None, "")
+    _plan_or_raise(plan_id)
+    with connect() as conn:
+        conn.execute("UPDATE dca_plans SET status='进行中', stopped_on=NULL, stop_reason='' WHERE id=?", (plan_id,))
 
 
 def delete_dca_plan(plan_id):
@@ -1002,8 +1037,10 @@ def delete_dca_plan(plan_id):
         conn.execute("DELETE FROM dca_plans WHERE id=?", (plan_id,))
 
 
-def _checked_records(plan_id, draft):
-    _plan_or_raise(plan_id)
+def _checked_records(plan_id, draft, incoming=()):
+    plan = _plan_or_raise(plan_id)
+    for row in incoming:
+        dca.check_record_allowed(plan, row)
     dca.apply_position(draft)
 
 
@@ -1025,7 +1062,7 @@ def save_dca_record(data, record_id=None):
         raise ValueError("确认记录不存在")
     if record_id is None:
         draft.append({**normalized, "id": 10**12})
-    _checked_records(plan_id, draft)
+    _checked_records(plan_id, draft, [normalized])
     fields = (
         plan_id,
         normalized["kind"],
@@ -1078,7 +1115,7 @@ def import_dca_records(plan_id, path):
     draft = list(existing)
     for index, row in enumerate(incoming):
         draft.append({**row, "id": 10**12 + index})
-    _checked_records(plan_id, draft)
+    _checked_records(plan_id, draft, incoming)
     with connect() as conn:
         conn.executemany(
             """
@@ -1131,7 +1168,8 @@ def dca_plan_rows():
                 "nav_source": source,
                 "market_value": market_value,
                 "pnl": pnl,
-                "cycle_label": dca.cycle_label(plan["cycle"], plan["debit_day"]),
+                "cycle_label": "不再扣款" if plan["status"] == dca.STOPPED else dca.cycle_label(plan["cycle"], plan["debit_day"]),
+                "status_label": dca.status_label(plan),
                 "records": len(records),
             }
         )
@@ -1240,19 +1278,68 @@ def delete_property(property_id):
         conn.execute("DELETE FROM properties WHERE id=?", (property_id,))
 
 
-def list_categories():
-    return _all("SELECT * FROM expense_categories ORDER BY sort_order, id")
+def list_categories(active_only=False):
+    sql = "SELECT * FROM expense_categories"
+    if active_only:
+        sql += " WHERE active=1"
+    return _all(sql + " ORDER BY sort_order, id")
 
 
-def save_category(name):
-    if remote := _remote():
-        return remote.save_category(name)
-    cleaned = name.strip()
+def choosable_categories(current_id=None):
+    """记新账、归类时可选的类别。编辑旧账时，保留它现在所属的已停用类别。"""
+    rows = list_categories(active_only=True)
+    if current_id is not None and all(row["id"] != current_id for row in rows):
+        current = _one("SELECT * FROM expense_categories WHERE id=?", (int(current_id),))
+        if current:
+            rows.insert(0, current)
+    return rows
+
+
+def category_overview():
+    counts = {
+        row["category_id"]: row
+        for row in _all("SELECT category_id, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM expenses GROUP BY category_id")
+    }
+    rules = {
+        row["category_id"]: row["n"]
+        for row in _all("SELECT category_id, COUNT(*) AS n FROM txn_rules WHERE category_id IS NOT NULL GROUP BY category_id")
+    }
+    rows = []
+    for category in list_categories():
+        stat = counts.get(category["id"], {})
+        rows.append({
+            **category,
+            "active": 1 if category.get("active", 1) else 0,
+            "expense_count": stat.get("n", 0) or 0,
+            "expense_total": stat.get("total", 0) or 0,
+            "rule_count": rules.get(category["id"], 0) or 0,
+        })
+    rows.sort(key=lambda row: (0 if row["active"] else 1, row["sort_order"], row["id"]))
+    return rows
+
+
+def _category_name(name):
+    cleaned = (name or "").strip()
     if not cleaned:
         raise ValueError("请填写类别名称")
+    if len(cleaned) > 40:
+        raise ValueError("类别名称过长")
+    return cleaned
+
+
+def save_category(name, category_id=None):
+    if remote := _remote():
+        return remote.save_category(name, category_id)
+    cleaned = _category_name(name)
     with connect() as conn:
-        order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM expense_categories").fetchone()["n"]
         try:
+            if category_id:
+                found = conn.execute("SELECT id FROM expense_categories WHERE id=?", (int(category_id),)).fetchone()
+                if found is None:
+                    raise ValueError("类别不存在")
+                conn.execute("UPDATE expense_categories SET name=? WHERE id=?", (cleaned, int(category_id)))
+                return int(category_id)
+            order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM expense_categories").fetchone()["n"]
             cur = conn.execute(
                 "INSERT INTO expense_categories(name, sort_order) VALUES(?, ?)",
                 (cleaned, order),
@@ -1260,6 +1347,71 @@ def save_category(name):
         except sqlite3.IntegrityError as exc:
             raise ValueError("这个类别已经存在") from exc
         return cur.lastrowid
+
+
+def set_category_active(category_id, active):
+    if remote := _remote():
+        return remote.set_category_active(category_id, active)
+    active = 1 if active else 0
+    with connect() as conn:
+        found = conn.execute("SELECT id FROM expense_categories WHERE id=?", (int(category_id),)).fetchone()
+        if found is None:
+            raise ValueError("类别不存在")
+        if not active:
+            others = conn.execute(
+                "SELECT COUNT(*) AS n FROM expense_categories WHERE active=1 AND id<>?",
+                (int(category_id),),
+            ).fetchone()["n"]
+            if not others:
+                raise ValueError("至少保留一个在用的类别")
+        conn.execute("UPDATE expense_categories SET active=? WHERE id=?", (active, int(category_id)))
+
+
+def move_category(source_id, target_id):
+    """把一个类别下的支出、明细分类、归类规则和年度预算改到另一个类别。原类别保留。"""
+    source_id, target_id = int(source_id), int(target_id)
+    if source_id == target_id:
+        raise ValueError("请选择另一个类别")
+    if remote := _remote():
+        return remote.move_category(source_id, target_id)
+    if _one("SELECT id FROM expense_categories WHERE id=?", (source_id,)) is None:
+        raise ValueError("类别不存在")
+    if _one("SELECT id FROM expense_categories WHERE id=?", (target_id,)) is None:
+        raise ValueError("类别不存在")
+    with connect() as conn:
+        expense_count = conn.execute("SELECT COUNT(*) AS n FROM expenses WHERE category_id=?", (source_id,)).fetchone()["n"]
+        conn.execute("UPDATE expenses SET category_id=? WHERE category_id=?", (target_id, source_id))
+        conn.execute(
+            "UPDATE account_txns SET category_id=?, updated_at=? WHERE category_id=?",
+            (target_id, now_text(), source_id),
+        )
+        for rule in conn.execute("SELECT id, field, keyword FROM txn_rules WHERE category_id=?", (source_id,)):
+            clash = conn.execute(
+                "SELECT id FROM txn_rules WHERE field=? AND keyword=? AND id<>?",
+                (rule["field"], rule["keyword"], rule["id"]),
+            ).fetchone()
+            if clash:
+                conn.execute("DELETE FROM txn_rules WHERE id=?", (rule["id"],))
+            else:
+                conn.execute("UPDATE txn_rules SET category_id=? WHERE id=?", (target_id, rule["id"]))
+        for line in conn.execute("SELECT * FROM budget_lines WHERE category_id=?", (source_id,)):
+            existing = conn.execute(
+                "SELECT id, amount, note FROM budget_lines WHERE year=? AND category_id=?",
+                (line["year"], target_id),
+            ).fetchone()
+            if existing:
+                note = existing["note"] or ""
+                extra = line["note"] or ""
+                if extra and extra not in note:
+                    note = (note + "；" + extra).strip("；") if note else extra
+                conn.execute(
+                    "UPDATE budget_lines SET amount=?, note=? WHERE id=?",
+                    ((existing["amount"] or 0) + (line["amount"] or 0), note, existing["id"]),
+                )
+                conn.execute("DELETE FROM budget_lines WHERE id=?", (line["id"],))
+            else:
+                conn.execute("UPDATE budget_lines SET category_id=? WHERE id=?", (target_id, line["id"]))
+    return expense_count
 
 
 def list_expenses():
@@ -1273,9 +1425,22 @@ def list_expenses():
     )
 
 
+def _usable_category(category_id, expense_id=None):
+    category = _one("SELECT id, active FROM expense_categories WHERE id=?", (int(category_id),))
+    if category is None:
+        raise ValueError("请选择支出类别")
+    if category.get("active", 1):
+        return category["id"]
+    current = _one("SELECT category_id FROM expenses WHERE id=?", (expense_id,)) if expense_id else None
+    if current and current["category_id"] == category["id"]:
+        return category["id"]
+    raise ValueError("这个类别已停用，请改到在用的类别")
+
+
 def save_expense(data, expense_id=None):
     if remote := _remote():
         return remote.save_expense(data, expense_id)
+    _usable_category(data["category_id"], expense_id)
     amount = r2(data["amount"])
     if amount is None or amount <= 0:
         raise ValueError("支出金额需要大于 0")
@@ -1346,10 +1511,13 @@ def budget_progress(year):
     for category in list_categories():
         planned = budgets.get(category["id"], {}).get("amount", 0) or 0
         actual = spent.get(category["id"], 0) or 0
+        active = category.get("active", 1)
+        if not active and not planned and not actual:
+            continue
         rows.append(
             {
                 "category_id": category["id"],
-                "category": category["name"],
+                "category": category["name"] if active else category["name"] + "（已停用）",
                 "planned": planned,
                 "actual": actual,
                 "remain": planned - actual,

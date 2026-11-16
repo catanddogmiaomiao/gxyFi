@@ -1,4 +1,4 @@
-"""「网页同步」窗口：登录网页账号、首次登录时挑选要上传的本机记录、退出登录。"""
+"""「网页同步」窗口：登录网页账号、修改网页端地址、首次登录时挑选要上传的本机记录、退出登录。"""
 
 from __future__ import annotations
 
@@ -160,6 +160,7 @@ class SyncDialog(QDialog):
         self.setMinimumWidth(520)
         self._pull = pull
         self.changed = False
+        self.notice = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(14)
@@ -168,20 +169,25 @@ class SyncDialog(QDialog):
         cfg = cloud.config()
         if cloud.enabled() and not cloud.expired():
             form = QFormLayout()
-            form.addRow("网页端", QLabel(cfg["url"]))
+            self.url_label = QLabel(cfg["url"])
+            self.synced_label = QLabel(cfg["synced_at"] or "—")
+            form.addRow("网页端", self.url_label)
             form.addRow("账号", QLabel(cfg["user"]))
-            form.addRow("上次同步", QLabel(cfg["synced_at"] or "—"))
+            form.addRow("上次同步", self.synced_label)
             layout.addLayout(form)
             layout.addWidget(_note("登录后，记账、修改、删除都会直接存到网页端，再下载回这台电脑显示。没有网络时只能查看，不能记账。刷新行情也由网页端去取。"))
             buttons = QHBoxLayout()
             logout = _button("退出登录", "danger")
             logout.clicked.connect(self.logout)
+            change = _button("修改网址")
+            change.clicked.connect(self.change_url)
             now = _button("立即同步", "primary")
             now.clicked.connect(self.sync_now)
             close = _button("关闭")
             close.clicked.connect(self.accept)
             buttons.addWidget(logout)
             buttons.addStretch(1)
+            buttons.addWidget(change)
             buttons.addWidget(close)
             buttons.addWidget(now)
             layout.addLayout(buttons)
@@ -221,6 +227,61 @@ class SyncDialog(QDialog):
         self.changed = True
         QMessageBox.information(self, "网页同步", message)
         self.accept()
+
+    def change_url(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修改网页端地址")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+        layout.addWidget(_note("改成同一个账号所在的新地址。保存后会用当前登录试一次同步；新地址不认这次登录时，需要重新输入密码。连不上则仍用现在的地址。"))
+        edit = QLineEdit(cloud.config()["url"])
+        edit.setPlaceholderText("https://")
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.addRow("网页端地址", edit)
+        layout.addLayout(form)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = _button("取消")
+        save = _button("保存", "primary")
+        save.setDefault(True)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+        cancel.clicked.connect(dialog.reject)
+        save.clicked.connect(lambda: self._save_url(dialog, edit))
+        edit.setFocus()
+        edit.selectAll()
+        dialog.exec()
+
+    def _save_url(self, dialog, edit):
+        try:
+            cloud.server_url(edit.text())
+        except cloud.CloudError as exc:
+            QMessageBox.warning(dialog, "地址不对", str(exc))
+            return
+        try:
+            with cloud._busy():
+                status, url = cloud.change_server(edit.text())
+        except cloud.CloudError as exc:
+            QMessageBox.warning(dialog, "没有改成", f"{exc}\n地址仍是 {cloud.config()['url']}")
+            return
+        dialog.accept()
+        if status == "same":
+            return
+        if status == "relogin":
+            QMessageBox.information(self, "需要重新登录", f"地址已改为 {url}。当前登录对新地址无效，请点右上角「重新登录」。")
+            self.notice = "网页端地址已更新，请重新登录"
+            self.accept()
+            return
+        self.url_label.setText(url)
+        self.synced_label.setText(cloud.config()["synced_at"] or "—")
+        self.status.setText(status_text())
+        self.notice = f"网页端地址已改为 {url}，并完成一次同步"
+        QMessageBox.information(self, "网页同步", f"网页端地址已改为 {url}，并完成一次同步。")
 
     def sync_now(self):
         self._pull()
