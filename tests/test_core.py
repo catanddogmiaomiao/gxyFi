@@ -289,7 +289,7 @@ class CoreTest(unittest.TestCase):
         wb = load_workbook(path)
         self.assertEqual(
             wb.sheetnames,
-            ["总览", "汇率", "账户", "余额快照", "账户明细", "投资持仓", "基金定投", "定投记录", "不动产", "支出", "预算", "行情"],
+            ["总览", "汇率", "账户", "余额快照", "账户明细", "投资持仓", "基金定投", "定投记录", "不动产", "支出", "收入", "预算", "行情"],
         )
         self.assertEqual(wb["总览"]["A2"].value, "储蓄")
         self.assertEqual(wb["总览"]["B2"].value, 0)
@@ -299,6 +299,76 @@ class CoreTest(unittest.TestCase):
         wb = load_workbook(path)
         self.assertEqual(wb["总览"]["B2"].value, 1000)
         self.assertTrue(wb["总览"]._charts)
+
+
+    def test_sale_keeps_or_drops_invested_amount(self):
+        holding = db.save_holding(
+            market.prepare_holding(
+                {
+                    "name": "黄金延期", "symbol": "Au(T+D)", "market": "GOLD", "quantity": 10,
+                    "avg_cost": 800, "manual_price": 850, "currency": "CNY", "account_label": "", "note": "",
+                }
+            )
+        )
+        db.sell_holding(holding, {"sell_price": 900, "sold_on": "2026-11-17", "count_invested": 0})
+        rows, total, missing = db.valued_holdings()
+        self.assertFalse(missing)
+        self.assertEqual(total, 0)
+        self.assertFalse(rows[0]["in_invest"])
+        self.assertAlmostEqual(rows[0]["pnl"], 1000)
+        self.assertEqual(db.portfolio_summary(date(2026, 11, 17))["invest_cny"], 0)
+        db.sell_holding(holding, {"sell_price": 900, "sold_on": "2026-11-17", "count_invested": 1})
+        rows, total, _missing = db.valued_holdings()
+        self.assertTrue(rows[0]["in_invest"])
+        self.assertAlmostEqual(total, 9000)
+        db.sell_holding(holding, {"sell_price": None})
+        rows, total, _missing = db.valued_holdings()
+        self.assertEqual(rows[0]["price"], 850)
+        self.assertAlmostEqual(total, 8500)
+
+        plan = db.save_dca_plan(
+            {"name": "沪深300", "symbol": "000300", "amount": 300, "cycle": "每月", "debit_day": 8,
+             "status": "进行中", "started_on": "2026-01-08", "manual_nav": 1.2, "note": ""}
+        )
+        db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-05-08", "amount": 300, "nav": 1, "shares": None, "note": ""})
+        db.sell_dca_plan(plan, {"sell_price": 1.2, "sold_on": "2026-11-17", "count_invested": 0})
+        valued, dca_total, _unpriced = db.dca_plan_rows()
+        self.assertEqual(valued[0]["proceeds"], 360)
+        self.assertEqual(valued[0]["pnl"], 60)
+        self.assertEqual(dca_total, 0)
+        self.assertIn("不计入投资", valued[0]["status_label"])
+        with self.assertRaises(ValueError):
+            db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-11-18", "amount": 300, "nav": 1, "shares": None, "note": ""})
+        db.sell_dca_plan(plan, {"sell_price": 1.2, "sold_on": "2026-11-17", "count_invested": 1})
+        self.assertEqual(db.dca_plan_rows()[1], 360)
+        db.sell_dca_plan(plan, {"sell_price": ""})
+        db.save_dca_record({"plan_id": plan, "kind": "定投", "trade_date": "2026-11-18", "amount": 300, "nav": 1, "shares": None, "note": ""})
+
+    def test_liquid_trend_carries_savings_and_investments(self):
+        account = db.save_account({"name": "工资卡", "institution": "", "kind": "活期", "currency": "CNY", "note": ""})
+        db.save_balance({"account_id": account, "as_of_date": "2026-10-01", "balance": 100, "note": ""})
+        db.save_balance({"account_id": account, "as_of_date": "2026-11-10", "balance": 400, "note": ""})
+        db._save_liquid_day("2026-11-10", 50, [{"name": "黄金", "group": "投资", "amount": 50}])
+        db._save_liquid_day("2026-11-17", 80, [{"name": "黄金", "group": "投资", "amount": 80}])
+        trend = db.liquid_trend("month", date(2026, 11, 17))
+        self.assertEqual(len(trend["points"]), 30)
+        by_day = {point["day"]: point for point in trend["points"]}
+        self.assertEqual(by_day["2026-11-09"]["savings"], 100)
+        self.assertIsNone(by_day["2026-11-09"]["invest"])
+        self.assertIsNone(by_day["2026-11-09"]["total"])
+        self.assertEqual(by_day["2026-11-10"]["savings"], 400)
+        self.assertEqual(by_day["2026-11-10"]["total"], 450)
+        self.assertEqual(by_day["2026-11-17"]["savings"], 400)
+        self.assertEqual(by_day["2026-11-17"]["invest"], 80)
+        self.assertEqual(by_day["2026-11-17"]["parts"][0]["group"], "储蓄")
+        year = db.liquid_trend("year", date(2026, 11, 17))
+        self.assertEqual(len(year["points"]), 12)
+        self.assertEqual(year["points"][-1]["day"], "2026-11-17")
+        self.assertEqual(year["points"][-1]["label"], "2026-11")
+        decade = db.liquid_trend("decade", date(2026, 11, 17))
+        self.assertEqual(len(decade["points"]), 10)
+        self.assertEqual(decade["points"][-1]["label"], "2026")
+        self.assertEqual(db.liquid_trend("week", date(2026, 11, 17))["points"][0]["day"], "2026-11-11")
 
 
 if __name__ == "__main__":

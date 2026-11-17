@@ -247,6 +247,52 @@ def edit_holding(parent, initial=None):
     }
 
 
+def edit_sale(parent, title, quantity, cost_total, initial=None):
+    """卖出价格、日期，以及卖出金额是否仍计入总览里的投资。"""
+    initial = initial or {}
+    price = _line("" if initial.get("sell_price") is None else initial.get("sell_price"), "成交价")
+    sold_on = _date_edit(initial.get("sold_on"))
+    count = QCheckBox("卖出金额仍计入整体投资")
+    count.setChecked(bool(initial.get("count_invested")))
+    preview = QLabel("")
+    preview.setWordWrap(True)
+    preview.setObjectName("PageSub")
+
+    def refresh():
+        value, error = _parse_number(price.text(), "卖出价格", required=True, allow_zero=False)
+        if error or not quantity:
+            preview.setText("盈亏 = 卖出金额 − 成本。勾选后，卖出金额仍算在总览的投资里；不勾选就从投资金额里拿掉，这笔记录还留着。")
+            return
+        proceeds = value * quantity
+        if cost_total is None:
+            preview.setText(f"卖出金额 {proceeds:,.2f}。还没有成本，算不出盈亏。")
+            return
+        pnl = proceeds - cost_total
+        rate = "" if not cost_total else f"（{pnl / cost_total * 100:.1f}%）"
+        preview.setText(
+            f"卖出金额 {proceeds:,.2f}，成本 {cost_total:,.2f}，盈亏 {pnl:+,.2f}{rate}。"
+            "勾选后卖出金额计入总览的投资；不勾选则不计入，记录仍保留。"
+        )
+
+    price.textChanged.connect(lambda *_: refresh())
+    refresh()
+
+    def validate():
+        value, error = _parse_number(price.text(), "卖出价格", required=True, allow_zero=False)
+        if error:
+            return error
+        price.setProperty("parsed", value)
+        return None
+
+    if not run_form(parent, title, [("卖出价格", price), ("卖出日期", sold_on), ("", count), ("", preview)], validate):
+        return None
+    return {
+        "sell_price": price.property("parsed"),
+        "sold_on": sold_on.date().toString("yyyy-MM-dd"),
+        "count_invested": 1 if count.isChecked() else 0,
+    }
+
+
 def edit_property(parent, initial=None):
     initial = initial or {}
     name = _line(initial.get("name", ""))
@@ -352,6 +398,33 @@ def edit_expense(parent, categories, initial=None):
     }
 
 
+def edit_income(parent, categories, initial=None):
+    initial = initial or {}
+    category = _combo([(item["name"], item["id"]) for item in categories], initial.get("category_id"))
+    occurred = _date_edit(initial.get("occurred_on"))
+    amount = _line("" if initial.get("amount") is None else initial.get("amount"))
+    payee = _line(initial.get("payee", ""), "来源或对象，可留空")
+    note = _line(initial.get("note", ""))
+    rows = [("日期", occurred), ("类别", category), ("金额", amount), ("对象", payee), ("备注", note)]
+
+    def validate():
+        value, error = _parse_number(amount.text(), "金额", required=True, allow_zero=False)
+        if error:
+            return error
+        amount.setProperty("parsed", value)
+        return None
+
+    if not run_form(parent, "收入", rows, validate):
+        return None
+    return {
+        "category_id": category.currentData(),
+        "occurred_on": occurred.date().toString("yyyy-MM-dd"),
+        "amount": amount.property("parsed"),
+        "payee": payee.text().strip(),
+        "note": note.text().strip(),
+    }
+
+
 def edit_budget(parent, category_name, amount=0, note=""):
     value_box = _line(amount, "这一年这一类的预算，人民币")
     note_box = _line(note)
@@ -369,8 +442,8 @@ def edit_budget(parent, category_name, amount=0, note=""):
     return {"amount": value_box.property("parsed"), "note": note_box.text().strip()}
 
 
-def edit_category(parent, initial=""):
-    name = _line(initial, "例如 父母赡养")
+def edit_category(parent, initial="", kind="支出"):
+    name = _line(initial, "例如 父母赡养" if kind == "支出" else "例如 工资")
     rows = [("类别名称", name)]
 
     def validate():
@@ -378,7 +451,7 @@ def edit_category(parent, initial=""):
             return "请填写类别名称"
         return None
 
-    title = "修改类别名称" if initial else "新的支出类别"
+    title = "修改类别名称" if initial else f"新的{kind}类别"
     if not run_form(parent, title, rows, validate):
         return None
     return name.text().strip()
@@ -590,6 +663,212 @@ def manage_categories(parent):
                 if not _confirm_box(dialog, f"恢复「{row['name']}」？之后可以继续用它记支出。", "恢复类别", "恢复", "取消"):
                     return
                 db.set_category_active(row["id"], True)
+        except ValueError as exc:
+            QMessageBox.warning(dialog, "无法保存", str(exc))
+            return
+        state["changed"] = True
+        fill()
+
+    add.clicked.connect(add_category)
+    rename.clicked.connect(rename_category)
+    toggle.clicked.connect(toggle_category)
+    move.clicked.connect(move_category)
+    close.clicked.connect(dialog.accept)
+    table.itemSelectionChanged.connect(sync_buttons)
+    fill()
+    dialog.exec()
+    return state["changed"]
+
+
+def manage_income_categories(parent):
+    """管理全部收入类别。有改动返回 True。"""
+    from gxyfi import db
+    from gxyfi.formatutil import fmt_cny
+    from gxyfi.widgets import FLAT, make_table, selected_id, set_cell
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("收入类别")
+    dialog.resize(720, 520)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(22, 20, 22, 18)
+    layout.setSpacing(12)
+    note = QLabel("停用后，记新账和归类明细时不会再出现这个类别，已经记过的仍留在原类别。要把过去的收入改到新类别，用「调整分类」。")
+    note.setWordWrap(True)
+    layout.addWidget(note)
+    table = make_table(["类别", "状态", "笔数", "合计", "归类规则"])
+    layout.addWidget(table, 1)
+    buttons = QHBoxLayout()
+    add = QPushButton("新增")
+    rename = QPushButton("改名")
+    toggle = QPushButton("停用")
+    move = QPushButton("调整分类")
+    close = QPushButton("关闭")
+    for button, name in (
+        (add, "PrimaryButton"),
+        (rename, "GhostButton"),
+        (toggle, "GhostButton"),
+        (move, "GhostButton"),
+        (close, "GhostButton"),
+    ):
+        button.setObjectName(name)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        buttons.addWidget(button)
+    buttons.addStretch(1)
+    layout.addLayout(buttons)
+    state = {"rows": [], "changed": False}
+
+    def fill():
+        current = selected_id(table)
+        state["rows"] = db.income_category_overview()
+        table.setRowCount(len(state["rows"]))
+        for index, row in enumerate(state["rows"]):
+            set_cell(table, index, 0, row["name"], row["id"], color=None if row["active"] else FLAT)
+            set_cell(table, index, 1, "在用" if row["active"] else "已停用", color=None if row["active"] else FLAT)
+            set_cell(table, index, 2, str(row["income_count"]), align="right")
+            set_cell(table, index, 3, fmt_cny(row["income_total"]), align="right")
+            set_cell(table, index, 4, str(row["rule_count"]), align="right")
+        if current is not None:
+            for index in range(table.rowCount()):
+                item = table.item(index, 0)
+                if item and item.data(Qt.ItemDataRole.UserRole) == current:
+                    table.selectRow(index)
+                    break
+        sync_buttons()
+
+    def current_row():
+        category_id = selected_id(table)
+        return next((row for row in state["rows"] if row["id"] == category_id), None)
+
+    def sync_buttons():
+        row = current_row()
+        rename.setEnabled(row is not None)
+        move.setEnabled(row is not None)
+        toggle.setEnabled(row is not None)
+        toggle.setText("恢复" if row and not row["active"] else "停用")
+
+    def ask_stop(row):
+        box = QMessageBox(dialog)
+        box.setWindowTitle("停用类别")
+        box.setText(
+            f"停用「{row['name']}」？这一类有 {row['income_count']} 笔收入，合计 {fmt_cny(row['income_total'])}。\n"
+            "停用后不能再选它记新账。过去的记录可以留在这一类，也可以现在调整到新类别。"
+        )
+        only = box.addButton("只停用", QMessageBox.ButtonRole.AcceptRole)
+        both = box.addButton("停用并调整分类", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == only:
+            return "stop"
+        if clicked == both:
+            return "move"
+        return None
+
+    def reclassify(source):
+        targets = [row for row in state["rows"] if row["id"] != source["id"]]
+        if not targets:
+            QMessageBox.information(dialog, "无法调整", "没有其他类别可以接收这些收入。")
+            return None
+        targets.sort(key=lambda row: (0 if row.get("active", 1) else 1, row.get("sort_order", 0), row["id"]))
+        pick = QDialog(dialog)
+        pick.setWindowTitle("调整分类")
+        pick.setMinimumWidth(480)
+        box = QVBoxLayout(pick)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(12)
+        tip = QLabel(f"把「{source['name']}」的全部收入、明细上的类别和自动归类规则改到新类别。原类别会保留。")
+        tip.setWordWrap(True)
+        box.addWidget(tip)
+        form = QFormLayout()
+        shown = source["name"] if source.get("active", 1) else source["name"] + "（已停用）"
+        form.addRow("原类别", QLabel(shown))
+        combo = _combo([
+            (row["name"] if row.get("active", 1) else row["name"] + "（已停用）", row["id"])
+            for row in targets
+        ])
+        form.addRow("调整到", combo)
+        box.addLayout(form)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("GhostButton")
+        ok = QPushButton("调整")
+        ok.setObjectName("PrimaryButton")
+        ok.setDefault(True)
+        actions.addWidget(cancel)
+        actions.addWidget(ok)
+        box.addLayout(actions)
+        cancel.clicked.connect(pick.reject)
+        ok.clicked.connect(pick.accept)
+        if pick.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return combo.currentData()
+
+    def add_category():
+        name = edit_category(dialog, kind="收入")
+        if not name:
+            return
+        try:
+            db.save_income_category(name)
+        except ValueError as exc:
+            QMessageBox.warning(dialog, "无法保存", str(exc))
+            return
+        state["changed"] = True
+        fill()
+
+    def rename_category():
+        row = current_row()
+        if row is None:
+            return
+        name = edit_category(dialog, row["name"], kind="收入")
+        if not name or name == row["name"]:
+            return
+        try:
+            db.save_income_category(name, row["id"])
+        except ValueError as exc:
+            QMessageBox.warning(dialog, "无法保存", str(exc))
+            return
+        state["changed"] = True
+        fill()
+
+    def move_category():
+        row = current_row()
+        if row is None:
+            return False
+        target_id = reclassify(row)
+        if target_id is None:
+            return False
+        try:
+            db.move_income_category(row["id"], target_id)
+        except ValueError as exc:
+            QMessageBox.warning(dialog, "无法调整", str(exc))
+            return False
+        target = next(item for item in state["rows"] if item["id"] == target_id)
+        QMessageBox.information(dialog, "已调整", f"已把「{row['name']}」的历史收入调整到「{target['name']}」。")
+        state["changed"] = True
+        fill()
+        return True
+
+    def toggle_category():
+        row = current_row()
+        if row is None:
+            return
+        try:
+            if row["active"]:
+                action = "stop"
+                if row["income_count"] or row["rule_count"]:
+                    action = ask_stop(row)
+                    if action is None:
+                        return
+                    if action == "move" and not move_category():
+                        return
+                elif not _confirm_box(dialog, f"停用「{row['name']}」？之后记新账和归类时不会再出现。", "停用类别", "停用", "取消"):
+                    return
+                db.set_income_category_active(row["id"], False)
+            else:
+                if not _confirm_box(dialog, f"恢复「{row['name']}」？之后可以继续用它记收入。", "恢复类别", "恢复", "取消"):
+                    return
+                db.set_income_category_active(row["id"], True)
         except ValueError as exc:
             QMessageBox.warning(dialog, "无法保存", str(exc))
             return

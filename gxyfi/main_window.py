@@ -29,7 +29,9 @@ from gxyfi.pages import (
     BudgetPage,
     DashboardPage,
     ExpensesPage,
+    IncomesPage,
     HoldingsPage,
+    LiquidPage,
     MarketPage,
     PropertyPage,
 )
@@ -107,10 +109,12 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.pages = [
             DashboardPage(),
+            LiquidPage(),
             AccountsPage(),
             HoldingsPage(),
             PropertyPage(),
             ExpensesPage(),
+            IncomesPage(),
             BudgetPage(),
             MarketPage(),
         ]
@@ -152,7 +156,7 @@ class MainWindow(QMainWindow):
         brand_wrap.addWidget(sub)
         layout.addLayout(brand_wrap)
         self.nav_buttons = []
-        labels = ["总览", "储蓄", "投资", "不动产", "支出", "预算", "行情"]
+        labels = ["总览", "非固资", "储蓄", "投资", "不动产", "支出", "收入", "预算", "行情"]
         for index, label in enumerate(labels):
             button = QPushButton(f"{index + 1:02d}    {label}")
             button.setObjectName("NavButton")
@@ -301,7 +305,8 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("刷新中…")
         self._status.showMessage("正在获取黄金、A 股、美股和汇率…")
-        self._worker = RefreshWorker(db.list_holdings(), db.get_setting("finnhub_token") or "")
+        open_holdings = [row for row in db.list_holdings() if row.get("sell_price") is None]
+        self._worker = RefreshWorker(open_holdings, db.get_setting("finnhub_token") or "")
         self._worker.finished_payload.connect(self._quotes_ready)
         self._worker.start()
 

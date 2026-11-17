@@ -245,7 +245,7 @@ class CategoryBars(QWidget):
         if not self._rows:
             painter.setPen(MUTED)
             painter.setFont(_font())
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "这一期还没有支出。可以手工记一笔，或把导入的明细归类。")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "这一期还没有记录。可以手工记一笔，或把导入的明细归类。")
             return
         name_w, text_w = 76, 190
         bar_left = name_w + 8
@@ -374,3 +374,109 @@ class StackedMonths(QWidget):
             if totals[index] > 0:
                 painter.setPen(BRIGHT)
                 painter.drawText(QRectF(left - 16, y - 19, width + 32, 16), Qt.AlignmentFlag.AlignCenter, f"{totals[index]:,.0f}")
+
+
+class TrendChart(QWidget):
+    """非固定资产的储蓄、投资和合计折线。点一个日期看当天分项。"""
+
+    picked = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self._points = []
+        self._selected = None
+        self.setMinimumHeight(260)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_points(self, points):
+        self._points = points
+        self._selected = None if not points else len(points) - 1
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(_font(9))
+        legend = [("储蓄", INK), ("投资", GOLD), ("合计", BRIGHT)]
+        x = 0
+        for name, color in legend:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(x, 6, 18, 3), 1, 1)
+            painter.setPen(MUTED)
+            width = painter.fontMetrics().horizontalAdvance(name) + 18
+            painter.drawText(QRectF(x + 24, 0, width, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+            x += width + 28
+        if not self._points:
+            painter.setPen(MUTED)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "还没有可画的余额或投资记录")
+            return
+        left, right, top, bottom = 8, self.width() - 8, 28, self.height() - 28
+        plot_h = max(bottom - top, 1)
+        plot_w = max(right - left, 1)
+        values = []
+        for point in self._points:
+            for key in ("savings", "invest", "total"):
+                if point.get(key) is not None:
+                    values.append(point[key])
+        if not values:
+            painter.setPen(MUTED)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "还没有可画的余额或投资记录")
+            return
+        low = min(0, min(values))
+        high = max(values)
+        if high == low:
+            high += 1
+        count = len(self._points)
+
+        def xpos(index):
+            if count == 1:
+                return left + plot_w / 2
+            return left + plot_w * index / (count - 1)
+
+        def ypos(value):
+            return bottom - plot_h * (value - low) / (high - low)
+
+        if low < 0 < high:
+            painter.setPen(QPen(TRACK, 1))
+            painter.drawLine(int(left), int(ypos(0)), int(right), int(ypos(0)))
+        if self._selected is not None and 0 <= self._selected < count:
+            painter.setPen(QPen(SELECTED, 8))
+            x = xpos(self._selected)
+            painter.drawLine(int(x), top, int(x), bottom)
+        for key, color in (("savings", INK), ("invest", GOLD), ("total", BRIGHT)):
+            previous = None
+            painter.setPen(QPen(color, 2))
+            for index, point in enumerate(self._points):
+                value = point.get(key)
+                if value is None:
+                    previous = None
+                    continue
+                current = (xpos(index), ypos(value))
+                if previous is not None:
+                    painter.drawLine(int(previous[0]), int(previous[1]), int(current[0]), int(current[1]))
+                painter.setBrush(color)
+                painter.drawEllipse(QRectF(current[0] - 3, current[1] - 3, 6, 6))
+                previous = current
+        painter.setPen(MUTED)
+        painter.setFont(_font(8))
+        step = 1 if count <= 12 else max(count // 6, 1)
+        for index, point in enumerate(self._points):
+            if index % step and index != count - 1:
+                continue
+            painter.drawText(QRectF(xpos(index) - 28, bottom + 4, 56, 18), Qt.AlignmentFlag.AlignCenter, point["label"])
+
+    def mousePressEvent(self, event):
+        if not self._points:
+            return
+        count = len(self._points)
+        left, plot_w = 8, max(self.width() - 16, 1)
+        if count == 1:
+            index = 0
+        else:
+            ratio = (event.position().x() - left) / plot_w
+            index = round(ratio * (count - 1))
+        index = max(0, min(count - 1, index))
+        self._selected = index
+        self.update()
+        self.picked.emit(index)

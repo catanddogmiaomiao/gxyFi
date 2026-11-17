@@ -58,8 +58,46 @@ def check_stop(stopped_on, records):
         raise ValueError(f"停止日期不能早于最后一笔定投（{max(paid)}）")
 
 
+def is_sold(row):
+    return row.get("sell_price") is not None
+
+
+def counted_sale(row):
+    return row.get("count_invested") in (True, 1, "1")
+
+
+def sale_status(row):
+    if not is_sold(row):
+        return ""
+    parts = ["已卖出"]
+    if row.get("sold_on"):
+        parts.append(row["sold_on"])
+    parts.append("计入投资" if counted_sale(row) else "不计入投资")
+    return " · ".join(parts)
+
+
+def normalize_sale(data):
+    price = _number(data.get("sell_price"), "卖出价格", required=True)
+    if price is None or price <= 0:
+        raise ValueError("卖出价格需要大于 0")
+    raw = str(data.get("sold_on") or "").strip().replace("/", "-").replace(".", "-")[:10]
+    if not raw:
+        raw = date.today().isoformat()
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("卖出日期请写成 YYYY-MM-DD") from None
+    flag = data.get("count_invested")
+    counted = 1 if flag in (True, 1, "1", "true", "True", "on", "yes") else 0
+    return {"sell_price": round(price, 4), "sold_on": raw, "count_invested": counted}
+
+
 def check_record_allowed(plan, record):
-    """停止后份额继续持有，可以记赎回和红利再投，但不能再记停止日期之后的定投。"""
+    """停止后份额继续持有，可以记赎回和红利再投，但不能再记停止日期之后的定投。已卖出则先撤销。"""
+    if is_sold(plan):
+        raise ValueError(
+            f"「{plan.get('name') or plan.get('symbol')}」已卖出。要继续记确认，请先撤销卖出。"
+        )
     if plan.get("status") != STOPPED or record["kind"] != "定投":
         return
     stopped_on = plan.get("stopped_on") or ""
@@ -71,6 +109,9 @@ def check_record_allowed(plan, record):
 
 
 def status_label(plan):
+    sold = sale_status(plan)
+    if sold:
+        return sold
     if plan.get("status") != STOPPED:
         return plan.get("status") or ""
     parts = [STOPPED]
@@ -191,6 +232,39 @@ def apply_position(records):
         elif cost < 0:
             cost = 0.0
     return round(shares, 4), round(cost, 2)
+
+
+def value_plan(plan, records):
+    """按确认记录算出份额和成本。已卖出时用卖出价格算盈亏，计入与否由 count_invested 决定。"""
+    shares, cost = apply_position(records)
+    sold = is_sold(plan)
+    if sold:
+        nav, source = float(plan["sell_price"]), "已卖出"
+        proceeds = 0.0 if shares <= 0 else round(shares * nav, 2)
+        counted = counted_sale(plan)
+        market_value = proceeds if counted else 0.0
+        pnl = round(proceeds - cost, 2)
+        included = counted
+    else:
+        nav, source = latest_nav(plan.get("manual_nav"), records)
+        proceeds = None
+        market_value = None if nav is None or shares <= 0 else round(shares * float(nav), 2)
+        pnl = None if market_value is None else round(market_value - cost, 2)
+        included = market_value is not None
+    return {
+        "shares": shares,
+        "cost": cost,
+        "nav": nav,
+        "nav_source": source,
+        "market_value": market_value,
+        "proceeds": proceeds,
+        "pnl": pnl,
+        "sold": sold,
+        "in_invest": included,
+        "cycle_label": "不再扣款" if plan.get("status") == STOPPED else cycle_label(plan.get("cycle"), plan.get("debit_day")),
+        "status_label": status_label(plan),
+        "records": len(records),
+    }
 
 
 def latest_nav(manual_nav, records):

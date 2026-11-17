@@ -1,4 +1,4 @@
-"""给导入的明细找归类建议：自己账户间的转账、可能重复的手工支出、学到的规则、常见商户。"""
+"""给导入的明细找归类建议：转账、手工支出/收入合并、学到的规则、常见商户。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,14 @@ CATEGORY_HINTS = {
     "教育": ("学费", "培训", "书店", "课程", "学校", "教育"),
     "娱乐": ("电影", "影城", "游戏", "旅游", "酒店", "门票", "会员"),
     "人情": ("红包", "礼金", "份子"),
+}
+INCOME_CATEGORY_HINTS = {
+    "工资": ("工资", "薪资", "薪水", "代发", "薪酬", "基本工资"),
+    "奖金": ("奖金", "年终", "绩效", "提成", "分红"),
+    "理财收益": ("利息", "分红", "收益", "理财", "结息", "红息"),
+    "租金": ("房租", "租金收入", "收租"),
+    "兼职": ("兼职", "劳务", "稿费", "咨询费"),
+    "报销": ("报销", "差旅"),
 }
 TRANSFER_DAYS = 3
 MERGE_DAYS = 2
@@ -42,8 +50,8 @@ def is_refund_like(txn, rules=()):
 
 
 def pending(txns, rules=()):
-    """需要处理的：所有没归类的支出，加上像退款的收入。"""
-    return [row for row in txns if not row.get("treat") and (row["amount"] < 0 or is_refund_like(row, rules))]
+    """需要处理的：没归类的支出，以及没归类的收入（含可能的退款）。"""
+    return [row for row in txns if not row.get("treat") and row["amount"] != 0]
 
 
 def find_transfers(txns):
@@ -87,7 +95,7 @@ def match_rule(txn, rules):
 
 def rule_for(txn, treat, category_id):
     """用户归类一笔后，记住「对方户名」，没有对方户名时记住摘要。"""
-    if treat not in ("支出", "退款", "不计"):
+    if treat not in ("支出", "退款", "收入", "不计"):
         return None
     counterparty = (txn.get("counterparty") or "").strip()
     summary = (txn.get("summary") or "").strip()
@@ -98,77 +106,146 @@ def rule_for(txn, treat, category_id):
     return None
 
 
-def suggest(rows, rules, manual_expenses, categories, history):
-    """返回 {明细 id: 建议}。建议含 treat、category_id、expense_id、reason、merge。"""
-    active_ids = {row["id"] for row in categories if row.get("active", 1)}
-    by_name = {row["name"]: row["id"] for row in categories if row["id"] in active_ids}
-    names = {row["id"]: row["name"] for row in categories}
-    learned = {}
+def suggest(rows, rules, manual_expenses, expense_categories, history, manual_incomes=(), income_categories=()):
+    """返回 {明细 id: 建议}。建议含 treat、category_id、expense_id、income_id、reason、merge。"""
+    expense_active = {row["id"] for row in expense_categories if row.get("active", 1)}
+    income_active = {row["id"] for row in income_categories if row.get("active", 1)}
+    expense_by_name = {row["name"]: row["id"] for row in expense_categories if row["id"] in expense_active}
+    income_by_name = {row["name"]: row["id"] for row in income_categories if row["id"] in income_active}
+    expense_names = {row["id"]: row["name"] for row in expense_categories}
+    income_names = {row["id"]: row["name"] for row in income_categories}
+    learned_expense = {}
+    learned_income = {}
     for row in sorted(history, key=lambda item: item["txn_date"]):
         key = (row.get("counterparty") or "").strip()
-        if key and row.get("category_id") in active_ids and row.get("treat") in ("支出", "退款"):
-            learned[key] = row["category_id"]
-    open_manual = [row for row in manual_expenses if not row.get("txn_id") and (row.get("source") or "手工") == "手工"]
-    used = set()
+        if not key:
+            continue
+        if row.get("treat") in ("支出", "退款") and row.get("category_id") in expense_active:
+            learned_expense[key] = row["category_id"]
+        if row.get("treat") == "收入" and row.get("category_id") in income_active:
+            learned_income[key] = row["category_id"]
+    open_manual_expenses = [row for row in manual_expenses if not row.get("txn_id") and (row.get("source") or "手工") == "手工"]
+    open_manual_incomes = [row for row in manual_incomes if not row.get("txn_id") and (row.get("source") or "手工") == "手工"]
+    used_expenses = set()
+    used_incomes = set()
     out = {}
     for txn in sorted(rows, key=lambda item: (item["txn_date"], item["id"])):
         if txn["amount"] < 0:
             amount = round(-txn["amount"], 2)
             candidates = [
-                row for row in open_manual
-                if row["id"] not in used and abs(row["amount"] - amount) < 0.005 and _days(row["occurred_on"], txn["txn_date"]) <= MERGE_DAYS
+                row for row in open_manual_expenses
+                if row["id"] not in used_expenses and abs(row["amount"] - amount) < 0.005 and _days(row["occurred_on"], txn["txn_date"]) <= MERGE_DAYS
             ]
             if candidates:
                 best = min(candidates, key=lambda row: (_days(row["occurred_on"], txn["txn_date"]), row["id"]))
-                used.add(best["id"])
+                used_expenses.add(best["id"])
                 out[txn["id"]] = {
-                    "treat": "支出", "category_id": best["category_id"], "expense_id": best["id"], "merge": True,
-                    "reason": f"可能和手工记录重复：{best['occurred_on']} {names.get(best['category_id'], '')} {best['amount']:,.2f} {best.get('payee') or ''}".strip(),
+                    "treat": "支出", "category_id": best["category_id"], "expense_id": best["id"], "income_id": None, "merge": True,
+                    "reason": f"可能和手工记录重复：{best['occurred_on']} {expense_names.get(best['category_id'], '')} {best['amount']:,.2f} {best.get('payee') or ''}".strip(),
+                }
+                continue
+        elif txn["amount"] > 0 and not is_refund_like(txn, rules):
+            amount = round(txn["amount"], 2)
+            candidates = [
+                row for row in open_manual_incomes
+                if row["id"] not in used_incomes and abs(row["amount"] - amount) < 0.005 and _days(row["occurred_on"], txn["txn_date"]) <= MERGE_DAYS
+            ]
+            if candidates:
+                best = min(candidates, key=lambda row: (_days(row["occurred_on"], txn["txn_date"]), row["id"]))
+                used_incomes.add(best["id"])
+                out[txn["id"]] = {
+                    "treat": "收入", "category_id": best["category_id"], "expense_id": None, "income_id": best["id"], "merge": True,
+                    "reason": f"可能和手工记录重复：{best['occurred_on']} {income_names.get(best['category_id'], '')} {best['amount']:,.2f} {best.get('payee') or ''}".strip(),
                 }
                 continue
         rule = match_rule(txn, rules)
-        if rule is not None and rule["treat"] != "不计" and rule.get("category_id") not in active_ids:
-            rule = None
         if rule is not None:
             treat = rule["treat"]
-            if (treat == "支出" and txn["amount"] < 0) or (treat == "退款" and txn["amount"] > 0) or treat == "不计":
+            category_id = rule.get("category_id")
+            active = income_active if treat == "收入" else expense_active
+            if treat != "不计" and category_id not in active:
+                rule = None
+        if rule is not None:
+            treat = rule["treat"]
+            ok = (
+                (treat == "支出" and txn["amount"] < 0)
+                or (treat == "退款" and txn["amount"] > 0)
+                or (treat == "收入" and txn["amount"] > 0)
+                or treat == "不计"
+            )
+            if ok:
                 out[txn["id"]] = {
-                    "treat": treat, "category_id": rule.get("category_id"), "expense_id": None, "merge": False,
+                    "treat": treat, "category_id": rule.get("category_id"), "expense_id": None, "income_id": None, "merge": False,
                     "reason": f"按规则：{'对方' if rule['field'] == 'counterparty' else '摘要'}「{rule['keyword']}」",
                 }
                 continue
         counterparty = (txn.get("counterparty") or "").strip()
-        treat = "退款" if txn["amount"] > 0 else "支出"
-        if counterparty in learned and learned[counterparty] in active_ids:
+        text = _text(txn)
+        if txn["amount"] > 0:
+            if is_refund_like(txn, rules):
+                treat = "退款"
+                if counterparty in learned_expense and learned_expense[counterparty] in expense_active:
+                    out[txn["id"]] = {
+                        "treat": treat, "category_id": learned_expense[counterparty], "expense_id": None, "income_id": None, "merge": False,
+                        "reason": f"「{counterparty}」以前归为这一类",
+                    }
+                    continue
+                for name, words in CATEGORY_HINTS.items():
+                    hit = next((word for word in words if word in text), None)
+                    if hit and name in expense_by_name:
+                        out[txn["id"]] = {
+                            "treat": treat, "category_id": expense_by_name[name], "expense_id": None, "income_id": None, "merge": False,
+                            "reason": f"含「{hit}」",
+                        }
+                        break
+                continue
+            if counterparty in learned_income and learned_income[counterparty] in income_active:
+                out[txn["id"]] = {
+                    "treat": "收入", "category_id": learned_income[counterparty], "expense_id": None, "income_id": None, "merge": False,
+                    "reason": f"「{counterparty}」以前归为这一类",
+                }
+                continue
+            for name, words in INCOME_CATEGORY_HINTS.items():
+                hit = next((word for word in words if word in text), None)
+                if hit and name in income_by_name:
+                    out[txn["id"]] = {
+                        "treat": "收入", "category_id": income_by_name[name], "expense_id": None, "income_id": None, "merge": False,
+                        "reason": f"含「{hit}」",
+                    }
+                    break
+            continue
+        treat = "支出"
+        if counterparty in learned_expense and learned_expense[counterparty] in expense_active:
             out[txn["id"]] = {
-                "treat": treat, "category_id": learned[counterparty], "expense_id": None, "merge": False,
+                "treat": treat, "category_id": learned_expense[counterparty], "expense_id": None, "income_id": None, "merge": False,
                 "reason": f"「{counterparty}」以前归为这一类",
             }
             continue
-        text = _text(txn)
-        if txn["amount"] < 0:
-            hit = next((word for word in EXCLUDE_WORDS if word in text), None)
-            if hit:
-                out[txn["id"]] = {"treat": "不计", "category_id": None, "expense_id": None, "merge": False, "reason": f"像是还款、理财或转存（含「{hit}」）"}
-                continue
+        hit = next((word for word in EXCLUDE_WORDS if word in text), None)
+        if hit:
+            out[txn["id"]] = {"treat": "不计", "category_id": None, "expense_id": None, "income_id": None, "merge": False, "reason": f"像是还款、理财或转存（含「{hit}」）"}
+            continue
         for name, words in CATEGORY_HINTS.items():
             hit = next((word for word in words if word in text), None)
-            if hit and name in by_name:
+            if hit and name in expense_by_name:
                 out[txn["id"]] = {
-                    "treat": treat, "category_id": by_name[name], "expense_id": None, "merge": False,
+                    "treat": treat, "category_id": expense_by_name[name], "expense_id": None, "income_id": None, "merge": False,
                     "reason": f"含「{hit}」",
                 }
                 break
     return out
 
 
-def describe(treat, category_id, names):
+def describe(treat, category_id, expense_names, income_names=None):
+    income_names = income_names or {}
     if treat == "支出":
-        return names.get(category_id, "支出")
+        return expense_names.get(category_id, "支出")
     if treat == "退款":
-        return f"退款 · 冲减{names.get(category_id, '')}"
+        return f"退款 · 冲减{expense_names.get(category_id, '')}"
+    if treat == "收入":
+        return f"收入 · {income_names.get(category_id, '')}"
     if treat == "不计":
-        return "不算支出"
+        return "不算支出/收入"
     if treat == "转账":
         return "自己账户间转账"
     return ""

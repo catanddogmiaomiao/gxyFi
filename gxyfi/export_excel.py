@@ -102,6 +102,7 @@ def export_workbook(path):
         ["不动产净值", round(summary["property_equity_cny"], 2), "现值减去登记的贷款余额"],
         ["净资产", round(net, 2), "以上三项合计"],
         ["本月支出", round(summary["month_expense"], 2), summary["today"][:7]],
+        ["本月收入", round(summary["month_income"], 2), summary["today"][:7]],
         ["本年预算", round(summary["budget_total"], 2), str(date.today().year)],
         ["本年已支出", round(summary["year_expense"], 2), ""],
     ]
@@ -320,6 +321,19 @@ def export_workbook(path):
         )
     write_table(wb.create_sheet("支出"), ["日期", "类别", "金额（人民币）", "对象", "备注"], expense_rows)
 
+    income_rows = []
+    for row in db.list_incomes():
+        income_rows.append(
+            [
+                _as_date(row["occurred_on"]),
+                row["category"],
+                row["amount"],
+                row["payee"],
+                row["note"],
+            ]
+        )
+    write_table(wb.create_sheet("收入"), ["日期", "类别", "金额（人民币）", "对象", "备注"], income_rows)
+
     budget_rows = []
     for row in db.list_budgets():
         budget_rows.append([row["year"], row["category"], row["amount"], row["note"]])
@@ -355,7 +369,7 @@ def export_workbook(path):
 
     wb.properties.creator = "gxyFi"
     wb.properties.title = "gxyFi 家庭资产台账"
-    wb.properties.subject = "储蓄、投资、不动产、支出、预算"
+    wb.properties.subject = "储蓄、投资、不动产、支出、收入、预算"
     wb.properties.description = "；".join(notes) if notes else "完整台账导出"
     wb.save(path)
     return path

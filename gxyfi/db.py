@@ -7,7 +7,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from gxyfi import dca, statement
@@ -16,7 +16,10 @@ ACCOUNT_KINDS = ["现金", "活期", "定期", "货币基金", "公积金", "其
 PROPERTY_KINDS = ["住宅", "商铺", "车位", "土地", "其他"]
 CURRENCIES = ["CNY", "USD", "HKD"]
 CATEGORIES = ["居住", "餐饮", "交通", "教育", "医疗", "保险", "日用", "人情", "娱乐", "其他"]
+INCOME_CATEGORIES = ["工资", "奖金", "理财收益", "租金", "兼职", "报销", "其他收入"]
 STALE_DAYS = 35
+EXPENSE_TREATS = ("支出", "退款")
+INCOME_TREATS = ("收入",)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -98,6 +101,23 @@ CREATE TABLE IF NOT EXISTS expenses (
     note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS income_categories (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS incomes (
+    id INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES income_categories(id),
+    occurred_on TEXT NOT NULL,
+    amount REAL NOT NULL,
+    payee TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    txn_id INTEGER,
+    source TEXT NOT NULL DEFAULT '手工',
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS budget_lines (
     id INTEGER PRIMARY KEY,
     year INTEGER NOT NULL,
@@ -148,6 +168,11 @@ CREATE TABLE IF NOT EXISTS account_txns (
     UNIQUE (account_id, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS account_txns_by_account ON account_txns(account_id, txn_date);
+CREATE TABLE IF NOT EXISTS liquid_days (
+    day TEXT PRIMARY KEY,
+    invest_cny REAL NOT NULL,
+    parts_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS txn_rules (
     id INTEGER PRIMARY KEY,
     field TEXT NOT NULL,
@@ -169,12 +194,18 @@ ADDED_COLUMNS = (
     ("dca_plans", "stopped_on", "TEXT"),
     ("dca_plans", "stop_reason", "TEXT NOT NULL DEFAULT ''"),
     ("expense_categories", "active", "INTEGER NOT NULL DEFAULT 1"),
+    ("holdings", "sold_on", "TEXT"),
+    ("holdings", "sell_price", "REAL"),
+    ("holdings", "count_invested", "INTEGER NOT NULL DEFAULT 0"),
+    ("dca_plans", "sold_on", "TEXT"),
+    ("dca_plans", "sell_price", "REAL"),
+    ("dca_plans", "count_invested", "INTEGER NOT NULL DEFAULT 0"),
 )
 TXN_COLUMNS = (
     "id", "account_id", "txn_date", "txn_time", "amount", "balance", "counterparty",
     "summary", "note", "fingerprint", "batch", "treat", "category_id", "created_at", "updated_at",
 )
-TREATS = ("", "支出", "退款", "不计", "转账")
+TREATS = ("", "支出", "退款", "收入", "不计", "转账")
 
 
 def db_path() -> Path:
@@ -240,6 +271,12 @@ def init_db():
                 "INSERT INTO expense_categories(name, sort_order) VALUES(?, ?)",
                 [(name, index) for index, name in enumerate(CATEGORIES)],
             )
+        income_count = conn.execute("SELECT COUNT(*) AS n FROM income_categories").fetchone()["n"]
+        if income_count == 0:
+            conn.executemany(
+                "INSERT INTO income_categories(name, sort_order) VALUES(?, ?)",
+                [(name, index) for index, name in enumerate(INCOME_CATEGORIES)],
+            )
         if conn.execute("SELECT 1 FROM settings WHERE key='fx'").fetchone() is None:
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES('fx', ?)",
@@ -265,10 +302,13 @@ CLOUD_TABLES = (
     ("properties", "properties"),
     ("expense_categories", "categories"),
     ("expenses", "expenses"),
+    ("income_categories", "incomeCategories"),
+    ("incomes", "incomes"),
     ("budget_lines", "budgets"),
     ("dca_plans", "dcaPlans"),
     ("dca_records", "dcaRecords"),
     ("txn_rules", "txnRules"),
+    ("liquid_days", "liquidDays"),
 )
 
 
@@ -664,11 +704,18 @@ def save_txn(data, txn_id=None):
                 (*fields, stamp, txn_id),
             )
             updated = dict(conn.execute("SELECT * FROM account_txns WHERE id=?", (txn_id,)).fetchone())
-            payload = _expense_payload(updated, updated["treat"])
-            conn.execute(
-                "UPDATE expenses SET occurred_on=?, amount=?, payee=? WHERE txn_id=? AND source='明细'",
-                (updated["txn_date"], payload["amount"], payload["payee"], txn_id),
-            )
+            if updated["treat"] in EXPENSE_TREATS:
+                payload = _expense_payload(updated, updated["treat"])
+                conn.execute(
+                    "UPDATE expenses SET occurred_on=?, amount=?, payee=? WHERE txn_id=? AND source='明细'",
+                    (updated["txn_date"], payload["amount"], payload["payee"], txn_id),
+                )
+            elif updated["treat"] == "收入":
+                payload = _income_payload(updated)
+                conn.execute(
+                    "UPDATE incomes SET occurred_on=?, amount=?, payee=? WHERE txn_id=? AND source='明细'",
+                    (updated["txn_date"], payload["amount"], payload["payee"], txn_id),
+                )
             _rebuild_balances(conn, row["account_id"])
             return txn_id
         account_id = int(data["account_id"])
@@ -709,10 +756,12 @@ def delete_txn_batch(account_id, batch):
 
 
 def _unlink(conn, where, args):
-    """明细删掉时：由明细生成的支出一起删；合并过的手工支出只解除关联。"""
+    """明细删掉时：由明细生成的支出/收入一起删；合并过的手工记录只解除关联。"""
     inner = f"SELECT id FROM account_txns WHERE {where}"
     conn.execute(f"DELETE FROM expenses WHERE source='明细' AND txn_id IN ({inner})", tuple(args))
     conn.execute(f"UPDATE expenses SET txn_id=NULL WHERE txn_id IN ({inner})", tuple(args))
+    conn.execute(f"DELETE FROM incomes WHERE source='明细' AND txn_id IN ({inner})", tuple(args))
+    conn.execute(f"UPDATE incomes SET txn_id=NULL WHERE txn_id IN ({inner})", tuple(args))
 
 
 def _expense_payload(txn, treat):
@@ -720,6 +769,11 @@ def _expense_payload(txn, treat):
     summary = txn.get("summary") or ""
     note = ("退款" + (f" · {summary}" if summary else "")) if treat == "退款" else summary
     return {"amount": r2(-float(txn["amount"])), "payee": payee, "note": note[:300]}
+
+
+def _income_payload(txn):
+    payee = (txn.get("counterparty") or txn.get("summary") or "")[:80]
+    return {"amount": r2(float(txn["amount"])), "payee": payee, "note": (txn.get("summary") or "")[:300]}
 
 
 def list_rules():
@@ -737,13 +791,15 @@ def delete_rules(rule_ids):
 
 
 def classify_txns(items, rules=()):
-    """items: [{id, treat, category_id, expense_id}]；rules: [{field, keyword, treat, category_id}]。"""
+    """items: [{id, treat, category_id, expense_id, income_id}]；rules: [{field, keyword, treat, category_id}]。"""
     if remote := _remote():
         return remote.classify_txns(items, rules)
     stamp = now_text()
     with connect() as conn:
-        active = {row["id"] for row in conn.execute("SELECT id FROM expense_categories WHERE active=1")}
-        used = set()
+        expense_active = {row["id"] for row in conn.execute("SELECT id FROM expense_categories WHERE active=1")}
+        income_active = {row["id"] for row in conn.execute("SELECT id FROM income_categories WHERE active=1")}
+        used_expenses = set()
+        used_incomes = set()
         for item in items:
             treat = item.get("treat") or ""
             if treat not in TREATS:
@@ -756,24 +812,46 @@ def classify_txns(items, rules=()):
                 raise ValueError("收入不能归为支出")
             if treat == "退款" and txn["amount"] <= 0:
                 raise ValueError("只有收入能记为退款")
+            if treat == "收入" and txn["amount"] <= 0:
+                raise ValueError("只有收入明细能归为收入")
             _unlink(conn, "id=?", (txn["id"],))
             category_id = None
-            merge_id = int(item.get("expense_id") or 0)
-            if treat == "支出" and merge_id:
-                target = conn.execute("SELECT id, category_id, txn_id FROM expenses WHERE id=?", (merge_id,)).fetchone()
-                if target is None or target["txn_id"] or merge_id in used:
+            merge_expense = int(item.get("expense_id") or 0)
+            merge_income = int(item.get("income_id") or 0)
+            if treat == "支出" and merge_expense:
+                target = conn.execute("SELECT id, category_id, txn_id FROM expenses WHERE id=?", (merge_expense,)).fetchone()
+                if target is None or target["txn_id"] or merge_expense in used_expenses:
                     raise ValueError("要合并的手工支出不存在或已经合并过")
-                used.add(merge_id)
+                used_expenses.add(merge_expense)
                 category_id = target["category_id"]
-                conn.execute("UPDATE expenses SET txn_id=? WHERE id=?", (txn["id"], merge_id))
-            elif treat in ("支出", "退款"):
+                conn.execute("UPDATE expenses SET txn_id=? WHERE id=?", (txn["id"], merge_expense))
+            elif treat == "收入" and merge_income:
+                target = conn.execute("SELECT id, category_id, txn_id FROM incomes WHERE id=?", (merge_income,)).fetchone()
+                if target is None or target["txn_id"] or merge_income in used_incomes:
+                    raise ValueError("要合并的手工收入不存在或已经合并过")
+                used_incomes.add(merge_income)
+                category_id = target["category_id"]
+                conn.execute("UPDATE incomes SET txn_id=? WHERE id=?", (txn["id"], merge_income))
+            elif treat in EXPENSE_TREATS:
                 category_id = int(item.get("category_id") or 0)
-                if category_id not in active:
-                    raise ValueError("这个类别已停用，请改到在用的类别")
+                if category_id not in expense_active:
+                    raise ValueError("这个支出类别已停用，请改到在用的类别")
                 payload = _expense_payload(txn, treat)
                 conn.execute(
                     """
                     INSERT INTO expenses(category_id, occurred_on, amount, payee, note, source, txn_id, created_at)
+                    VALUES(?, ?, ?, ?, ?, '明细', ?, ?)
+                    """,
+                    (category_id, txn["txn_date"], payload["amount"], payload["payee"], payload["note"], txn["id"], stamp),
+                )
+            elif treat == "收入":
+                category_id = int(item.get("category_id") or 0)
+                if category_id not in income_active:
+                    raise ValueError("这个收入类别已停用，请改到在用的类别")
+                payload = _income_payload(txn)
+                conn.execute(
+                    """
+                    INSERT INTO incomes(category_id, occurred_on, amount, payee, note, source, txn_id, created_at)
                     VALUES(?, ?, ?, ?, ?, '明细', ?, ?)
                     """,
                     (category_id, txn["txn_date"], payload["amount"], payload["payee"], payload["note"], txn["id"], stamp),
@@ -785,9 +863,10 @@ def classify_txns(items, rules=()):
         for rule in rules:
             keyword = (rule.get("keyword") or "").strip()[:40]
             treat = rule.get("treat")
-            if rule.get("field") not in ("counterparty", "summary") or not keyword or treat not in ("支出", "退款", "不计"):
+            if rule.get("field") not in ("counterparty", "summary") or not keyword or treat not in ("支出", "退款", "收入", "不计"):
                 continue
             category_id = None if treat == "不计" else rule.get("category_id")
+            active = income_active if treat == "收入" else expense_active
             if treat != "不计" and category_id not in active:
                 continue
             conn.execute(
@@ -910,6 +989,28 @@ def delete_holding(holding_id):
         return remote.delete_holding(holding_id)
     with connect() as conn:
         conn.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
+
+
+def sell_holding(holding_id, data):
+    """按卖出价格结清这笔持仓。count_invested 为 1 时，卖出金额仍计入总览的投资。"""
+    clearing = data.get("sell_price") in (None, "")
+    sale = None if clearing else dca.normalize_sale(data)
+    if remote := _remote():
+        return remote.clear_holding_sale(holding_id) if clearing else remote.sell_holding(holding_id, sale)
+    if _one("SELECT id FROM holdings WHERE id=?", (holding_id,)) is None:
+        raise ValueError("持仓不存在")
+    with connect() as conn:
+        if clearing:
+            conn.execute(
+                "UPDATE holdings SET sell_price=NULL, sold_on=NULL, count_invested=0 WHERE id=?",
+                (holding_id,),
+            )
+            return holding_id
+        conn.execute(
+            "UPDATE holdings SET sell_price=?, sold_on=?, count_invested=? WHERE id=?",
+            (sale["sell_price"], sale["sold_on"], sale["count_invested"], holding_id),
+        )
+        return holding_id
 
 
 def list_dca_plans():
@@ -1037,6 +1138,31 @@ def delete_dca_plan(plan_id):
         conn.execute("DELETE FROM dca_plans WHERE id=?", (plan_id,))
 
 
+def sell_dca_plan(plan_id, data):
+    """按卖出价格结清这个定投计划的剩余份额。count_invested 为 1 时，卖出金额仍计入总览的投资。"""
+    clearing = data.get("sell_price") in (None, "")
+    sale = None if clearing else dca.normalize_sale(data)
+    if remote := _remote():
+        return remote.clear_dca_sale(plan_id) if clearing else remote.sell_dca_plan(plan_id, sale)
+    _plan_or_raise(plan_id)
+    if not clearing:
+        shares, _cost = dca.apply_position(list_dca_records(plan_id))
+        if shares <= 0:
+            raise ValueError("没有可卖出的份额")
+    with connect() as conn:
+        if clearing:
+            conn.execute(
+                "UPDATE dca_plans SET sell_price=NULL, sold_on=NULL, count_invested=0 WHERE id=?",
+                (plan_id,),
+            )
+            return plan_id
+        conn.execute(
+            "UPDATE dca_plans SET sell_price=?, sold_on=?, count_invested=? WHERE id=?",
+            (sale["sell_price"], sale["sold_on"], sale["count_invested"], plan_id),
+        )
+        return plan_id
+
+
 def _checked_records(plan_id, draft, incoming=()):
     plan = _plan_or_raise(plan_id)
     for row in incoming:
@@ -1151,28 +1277,12 @@ def dca_plan_rows():
     unpriced = 0
     for plan in plans:
         records = grouped.get(plan["id"], [])
-        shares, cost = dca.apply_position(records)
-        nav, source = dca.latest_nav(plan["manual_nav"], records)
-        market_value = None if nav is None or shares <= 0 else round(shares * nav, 2)
-        pnl = None if market_value is None else round(market_value - cost, 2)
-        if shares > 0 and nav is None:
+        row = {**plan, **dca.value_plan(plan, records)}
+        if row["shares"] > 0 and not row["sold"] and row["nav"] is None:
             unpriced += 1
-        if market_value is not None:
-            total += market_value
-        valued.append(
-            {
-                **plan,
-                "shares": shares,
-                "cost": cost,
-                "nav": nav,
-                "nav_source": source,
-                "market_value": market_value,
-                "pnl": pnl,
-                "cycle_label": "不再扣款" if plan["status"] == dca.STOPPED else dca.cycle_label(plan["cycle"], plan["debit_day"]),
-                "status_label": dca.status_label(plan),
-                "records": len(records),
-            }
-        )
+        if row["in_invest"] and row["market_value"] is not None:
+            total += row["market_value"]
+        valued.append(row)
     return valued, round(total, 2), unpriced
 
 
@@ -1302,7 +1412,9 @@ def category_overview():
     }
     rules = {
         row["category_id"]: row["n"]
-        for row in _all("SELECT category_id, COUNT(*) AS n FROM txn_rules WHERE category_id IS NOT NULL GROUP BY category_id")
+        for row in _all(
+            "SELECT category_id, COUNT(*) AS n FROM txn_rules WHERE category_id IS NOT NULL AND treat IN ('支出', '退款') GROUP BY category_id"
+        )
     }
     rows = []
     for category in list_categories():
@@ -1382,10 +1494,16 @@ def move_category(source_id, target_id):
         expense_count = conn.execute("SELECT COUNT(*) AS n FROM expenses WHERE category_id=?", (source_id,)).fetchone()["n"]
         conn.execute("UPDATE expenses SET category_id=? WHERE category_id=?", (target_id, source_id))
         conn.execute(
-            "UPDATE account_txns SET category_id=?, updated_at=? WHERE category_id=?",
+            """
+            UPDATE account_txns SET category_id=?, updated_at=?
+            WHERE category_id=? AND treat IN ('支出', '退款')
+            """,
             (target_id, now_text(), source_id),
         )
-        for rule in conn.execute("SELECT id, field, keyword FROM txn_rules WHERE category_id=?", (source_id,)):
+        for rule in conn.execute(
+            "SELECT id, field, keyword FROM txn_rules WHERE category_id=? AND treat IN ('支出', '退款')",
+            (source_id,),
+        ):
             clash = conn.execute(
                 "SELECT id FROM txn_rules WHERE field=? AND keyword=? AND id<>?",
                 (rule["field"], rule["keyword"], rule["id"]),
@@ -1491,6 +1609,203 @@ def delete_expense(expense_id):
             (now_text(), expense_id),
         )
         conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+
+
+def list_income_categories(active_only=False):
+    sql = "SELECT * FROM income_categories"
+    if active_only:
+        sql += " WHERE active=1"
+    return _all(sql + " ORDER BY sort_order, id")
+
+
+def choosable_income_categories(current_id=None):
+    rows = list_income_categories(active_only=True)
+    if current_id is not None and all(row["id"] != current_id for row in rows):
+        current = _one("SELECT * FROM income_categories WHERE id=?", (int(current_id),))
+        if current:
+            rows.insert(0, current)
+    return rows
+
+
+def income_category_overview():
+    counts = {
+        row["category_id"]: row
+        for row in _all("SELECT category_id, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM incomes GROUP BY category_id")
+    }
+    rules = {
+        row["category_id"]: row["n"]
+        for row in _all(
+            "SELECT category_id, COUNT(*) AS n FROM txn_rules WHERE category_id IS NOT NULL AND treat='收入' GROUP BY category_id"
+        )
+    }
+    rows = []
+    for category in list_income_categories():
+        stat = counts.get(category["id"], {})
+        rows.append({
+            **category,
+            "active": 1 if category.get("active", 1) else 0,
+            "income_count": stat.get("n", 0) or 0,
+            "income_total": stat.get("total", 0) or 0,
+            "rule_count": rules.get(category["id"], 0) or 0,
+        })
+    rows.sort(key=lambda row: (0 if row["active"] else 1, row["sort_order"], row["id"]))
+    return rows
+
+
+def save_income_category(name, category_id=None):
+    if remote := _remote():
+        return remote.save_income_category(name, category_id)
+    cleaned = _category_name(name)
+    with connect() as conn:
+        try:
+            if category_id:
+                found = conn.execute("SELECT id FROM income_categories WHERE id=?", (int(category_id),)).fetchone()
+                if found is None:
+                    raise ValueError("类别不存在")
+                conn.execute("UPDATE income_categories SET name=? WHERE id=?", (cleaned, int(category_id)))
+                return int(category_id)
+            order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM income_categories").fetchone()["n"]
+            cur = conn.execute(
+                "INSERT INTO income_categories(name, sort_order) VALUES(?, ?)",
+                (cleaned, order),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("这个类别已经存在") from exc
+        return cur.lastrowid
+
+
+def set_income_category_active(category_id, active):
+    if remote := _remote():
+        return remote.set_income_category_active(category_id, active)
+    active = 1 if active else 0
+    with connect() as conn:
+        found = conn.execute("SELECT id FROM income_categories WHERE id=?", (int(category_id),)).fetchone()
+        if found is None:
+            raise ValueError("类别不存在")
+        if not active:
+            others = conn.execute(
+                "SELECT COUNT(*) AS n FROM income_categories WHERE active=1 AND id<>?",
+                (int(category_id),),
+            ).fetchone()["n"]
+            if not others:
+                raise ValueError("至少保留一个在用的类别")
+        conn.execute("UPDATE income_categories SET active=? WHERE id=?", (active, int(category_id)))
+
+
+def move_income_category(source_id, target_id):
+    """把一个收入类别下的收入、明细分类和归类规则改到另一个类别。原类别保留。"""
+    source_id, target_id = int(source_id), int(target_id)
+    if source_id == target_id:
+        raise ValueError("请选择另一个类别")
+    if remote := _remote():
+        return remote.move_income_category(source_id, target_id)
+    if _one("SELECT id FROM income_categories WHERE id=?", (source_id,)) is None:
+        raise ValueError("类别不存在")
+    if _one("SELECT id FROM income_categories WHERE id=?", (target_id,)) is None:
+        raise ValueError("类别不存在")
+    with connect() as conn:
+        income_count = conn.execute("SELECT COUNT(*) AS n FROM incomes WHERE category_id=?", (source_id,)).fetchone()["n"]
+        conn.execute("UPDATE incomes SET category_id=? WHERE category_id=?", (target_id, source_id))
+        conn.execute(
+            "UPDATE account_txns SET category_id=?, updated_at=? WHERE category_id=? AND treat='收入'",
+            (target_id, now_text(), source_id),
+        )
+        for rule in conn.execute("SELECT id, field, keyword FROM txn_rules WHERE category_id=? AND treat='收入'", (source_id,)):
+            clash = conn.execute(
+                "SELECT id FROM txn_rules WHERE field=? AND keyword=? AND id<>?",
+                (rule["field"], rule["keyword"], rule["id"]),
+            ).fetchone()
+            if clash:
+                conn.execute("DELETE FROM txn_rules WHERE id=?", (rule["id"],))
+            else:
+                conn.execute("UPDATE txn_rules SET category_id=? WHERE id=?", (target_id, rule["id"]))
+    return income_count
+
+
+def list_incomes():
+    return _all(
+        """
+        SELECT e.*, c.name AS category
+        FROM incomes e
+        JOIN income_categories c ON c.id = e.category_id
+        ORDER BY e.occurred_on DESC, e.id DESC
+        """
+    )
+
+
+def _usable_income_category(category_id, income_id=None):
+    category = _one("SELECT id, active FROM income_categories WHERE id=?", (int(category_id),))
+    if category is None:
+        raise ValueError("请选择收入类别")
+    if category.get("active", 1):
+        return category["id"]
+    current = _one("SELECT category_id FROM incomes WHERE id=?", (income_id,)) if income_id else None
+    if current and current["category_id"] == category["id"]:
+        return category["id"]
+    raise ValueError("这个类别已停用，请改到在用的类别")
+
+
+def save_income(data, income_id=None):
+    if remote := _remote():
+        return remote.save_income(data, income_id)
+    _usable_income_category(data["category_id"], income_id)
+    amount = r2(data["amount"])
+    if amount is None or amount <= 0:
+        raise ValueError("收入金额需要大于 0")
+    fields = (
+        int(data["category_id"]),
+        data["occurred_on"],
+        amount,
+        data.get("payee", "").strip(),
+        data.get("note", "").strip(),
+    )
+    with connect() as conn:
+        if income_id:
+            conn.execute(
+                """
+                UPDATE incomes
+                SET category_id=?, occurred_on=?, amount=?, payee=?, note=?
+                WHERE id=?
+                """,
+                (*fields, income_id),
+            )
+            conn.execute(
+                """
+                UPDATE account_txns SET category_id=?, updated_at=?
+                WHERE id=(SELECT txn_id FROM incomes WHERE id=?)
+                """,
+                (fields[0], now_text(), income_id),
+            )
+            return income_id
+        cur = conn.execute(
+            """
+            INSERT INTO incomes(category_id, occurred_on, amount, payee, note, created_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (*fields, now_text()),
+        )
+        return cur.lastrowid
+
+
+def delete_income(income_id):
+    if remote := _remote():
+        return remote.delete_income(income_id)
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE account_txns SET treat='不计', category_id=NULL, updated_at=?
+            WHERE id=(SELECT txn_id FROM incomes WHERE id=?)
+            """,
+            (now_text(), income_id),
+        )
+        conn.execute("DELETE FROM incomes WHERE id=?", (income_id,))
+
+
+def income_total(start, end):
+    return _one(
+        "SELECT COALESCE(SUM(amount), 0) AS amount FROM incomes WHERE occurred_on>=? AND occurred_on<?",
+        (start, end),
+    )["amount"]
 
 
 def budget_progress(year):
@@ -1609,7 +1924,14 @@ def valued_holdings(rates=None):
     total = 0.0
     for holding in list_holdings():
         quote = quotes.get((holding["market"], holding["symbol"]))
-        if holding["manual_price"] is not None:
+        sold = dca.is_sold(holding)
+        if sold:
+            price = holding["sell_price"]
+            source = dca.sale_status(holding)
+            prev = None
+            quoted_at = ""
+            quote_name = holding["name"]
+        elif holding["manual_price"] is not None:
             price = holding["manual_price"]
             source = "手工"
             prev = None if quote is None else quote["prev_close"]
@@ -1630,16 +1952,23 @@ def valued_holdings(rates=None):
         market_value = None if price is None else price * holding["quantity"]
         cost = None if holding["avg_cost"] is None else holding["avg_cost"] * holding["quantity"]
         pnl = None if market_value is None or cost is None else market_value - cost
-        cny = None if market_value is None else to_cny(market_value, holding["currency"], rates)
+        gross_cny = None if market_value is None else to_cny(market_value, holding["currency"], rates)
+        counted = dca.counted_sale(holding)
+        if sold and not counted:
+            cny = 0.0
+            in_invest = False
+        else:
+            cny = gross_cny
+            in_invest = gross_cny is not None
+            if market_value is not None and gross_cny is None:
+                missing = True
         cost_cny = None if cost is None else to_cny(cost, holding["currency"], rates)
         pnl_cny = None if pnl is None else to_cny(pnl, holding["currency"], rates)
         ret = None if pnl is None or not cost else pnl / cost
-        if market_value is not None and cny is None:
-            missing = True
-        if cny is not None:
+        if in_invest and cny is not None:
             total += cny
         day = None
-        if price is not None and prev not in (None, 0):
+        if not sold and price is not None and prev not in (None, 0):
             day = (price - prev) / prev
         valued.append(
             {
@@ -1653,28 +1982,37 @@ def valued_holdings(rates=None):
                 "cost": cost,
                 "pnl": pnl,
                 "cny": cny,
+                "gross_cny": gross_cny,
                 "cost_cny": cost_cny,
                 "pnl_cny": pnl_cny,
                 "ret": ret,
                 "day": day,
+                "sold": sold,
+                "in_invest": in_invest,
             }
         )
     for row in valued:
-        row["weight"] = None if row["cny"] is None or not total else row["cny"] / total
+        row["weight"] = None if not row.get("in_invest") or row["cny"] is None or not total else row["cny"] / total
     return valued, total, missing
 
 
 def holdings_totals(rows):
-    """只合计填了成本、也有价格的持仓，收益率才有意义。"""
-    priced = [row for row in rows if row["cny"] is not None and row["cost_cny"] is not None]
+    """只合计仍计入投资、并且填了成本也有价格的持仓。已卖出但不计入的，单独给出已实现盈亏。"""
+    counted = [row for row in rows if row.get("in_invest")]
+    priced = [row for row in counted if row["cny"] is not None and row["cost_cny"] is not None]
     cost = sum(row["cost_cny"] for row in priced)
     value = sum(row["cny"] for row in priced)
+    left_out = [row for row in rows if row.get("sold") and not row.get("in_invest")]
+    realized = [row["pnl_cny"] for row in left_out if row["pnl_cny"] is not None]
     return {
-        "value": sum(row["cny"] for row in rows if row["cny"] is not None),
+        "value": sum(row["cny"] for row in counted if row["cny"] is not None),
         "cost": cost,
         "pnl": value - cost,
         "ret": None if not cost else (value - cost) / cost,
-        "without_cost": sum(1 for row in rows if row["cny"] is not None and row["cost_cny"] is None),
+        "without_cost": sum(1 for row in counted if row["cny"] is not None and row["cost_cny"] is None),
+        "sold_kept": sum(1 for row in rows if row.get("sold") and row.get("in_invest")),
+        "sold_out": len(left_out),
+        "realized_out": None if not realized else sum(realized),
     }
 
 
@@ -1737,6 +2075,7 @@ def portfolio_summary(today=None):
         "property_missing": property_missing,
         "rent_monthly": rent_total,
         "month_expense": expense_total(month_start.isoformat(), month_end.isoformat()),
+        "month_income": income_total(month_start.isoformat(), month_end.isoformat()),
         "year_expense": actual_year,
         "budget_total": planned,
         "budget_rows": budgets,
@@ -1746,3 +2085,155 @@ def portfolio_summary(today=None):
         "fx": rates,
         "today": today.isoformat(),
     }
+
+
+def capture_liquid_snapshot(today=None):
+    """记下当天的投资分项。储蓄不另存，看图时按余额快照回推。"""
+    day = (today or date.today()).isoformat()
+    holdings, invest, _missing = valued_holdings()
+    plans, dca_total, _unpriced = dca_plan_rows()
+    invest = round(invest + dca_total, 2)
+    parts = []
+    for row in holdings:
+        if row.get("in_invest") and row.get("cny"):
+            parts.append({"name": row["name"], "group": "投资", "amount": round(row["cny"], 2)})
+    for row in plans:
+        if row.get("in_invest") and row.get("market_value"):
+            parts.append({"name": row["name"], "group": "投资", "amount": round(float(row["market_value"]), 2)})
+    payload = {"day": day, "invest_cny": invest, "parts": parts}
+    if remote := _remote():
+        return remote.save_liquid_day(payload)
+    _save_liquid_day(day, invest, parts)
+    return payload
+
+
+def _save_liquid_day(day, invest, parts):
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO liquid_days(day, invest_cny, parts_json) VALUES(?, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET invest_cny=excluded.invest_cny, parts_json=excluded.parts_json
+            """,
+            (day, invest, json.dumps(parts, ensure_ascii=False)),
+        )
+
+
+def list_liquid_days():
+    return _all("SELECT day, invest_cny, parts_json FROM liquid_days ORDER BY day")
+
+
+def liquid_sample_days(span, today):
+    today = today if isinstance(today, date) else date.fromisoformat(today)
+    if span == "week":
+        return [(today - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+    if span == "month":
+        return [(today - timedelta(days=offset)).isoformat() for offset in range(29, -1, -1)]
+    if span == "year":
+        year, month = today.year, today.month
+        found = []
+        for _ in range(12):
+            if month == 12:
+                last = date(year + 1, 1, 1) - timedelta(days=1)
+            else:
+                last = date(year, month + 1, 1) - timedelta(days=1)
+            found.append(min(last, today).isoformat())
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+        return list(reversed(found))
+    if span == "decade":
+        return [min(date(year, 12, 31), today).isoformat() for year in range(today.year - 9, today.year + 1)]
+    raise ValueError("时间范围不正确")
+
+
+def _liquid_label(span, day):
+    if span == "year":
+        return day[:7]
+    if span == "decade":
+        return day[:4]
+    return day[5:]
+
+
+def _savings_as_of(day, by_account, rates):
+    total = 0.0
+    parts = []
+    missing = False
+    for rows in by_account.values():
+        chosen = None
+        for entry in rows:
+            if entry["as_of_date"] <= day:
+                chosen = entry
+            else:
+                break
+        if chosen is None:
+            continue
+        cny = to_cny(chosen["balance"], chosen["currency"], rates)
+        if cny is None:
+            missing = True
+            continue
+        amount = round(cny, 2)
+        parts.append({"name": chosen["name"], "group": "储蓄", "amount": amount})
+        total += amount
+    parts.sort(key=lambda item: (-item["amount"], item["name"]))
+    return round(total, 2), parts, missing
+
+
+def _latest_on_or_before(days, day):
+    found = None
+    for item in days:
+        if item <= day:
+            found = item
+        else:
+            break
+    return found
+
+
+def liquid_trend(span="month", today=None):
+    """非固定资产：储蓄按余额快照逐日结转，投资用已记下的每日分项结转。"""
+    today = today or date.today()
+    days = liquid_sample_days(span, today)
+    entries = _all(
+        """
+        SELECT b.account_id, b.as_of_date, b.balance, a.currency, a.name
+        FROM balance_entries b JOIN accounts a ON a.id = b.account_id
+        ORDER BY b.as_of_date, b.id
+        """
+    )
+    by_account = {}
+    for entry in entries:
+        by_account.setdefault(entry["account_id"], []).append(entry)
+    rates = fx_rates()
+    snaps = {}
+    for row in list_liquid_days():
+        snaps[row["day"]] = {
+            "invest_cny": row["invest_cny"],
+            "parts": json.loads(row["parts_json"] or "[]"),
+        }
+    snap_days = sorted(snaps)
+    points = []
+    for day in days:
+        savings, savings_parts, missing = _savings_as_of(day, by_account, rates)
+        invest_day = _latest_on_or_before(snap_days, day)
+        if invest_day is None:
+            invest = None
+            invest_parts = []
+            total = None
+        else:
+            snap = snaps[invest_day]
+            invest = round(float(snap["invest_cny"]), 2)
+            invest_parts = snap["parts"]
+            total = round(savings + invest, 2)
+        points.append(
+            {
+                "day": day,
+                "label": _liquid_label(span, day),
+                "savings": savings,
+                "invest": invest,
+                "total": total,
+                "fx_missing": missing,
+                "parts": savings_parts + invest_parts,
+            }
+        )
+    known = [point["day"] for point in points if point["invest"] is not None]
+    return {"span": span, "points": points, "invest_since": known[0] if known else (snap_days[0] if snap_days else None)}

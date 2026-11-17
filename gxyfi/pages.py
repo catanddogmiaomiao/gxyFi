@@ -33,8 +33,11 @@ from gxyfi.dialogs import (
     edit_expense,
     edit_fx,
     edit_holding,
+    edit_income,
+    edit_sale,
     edit_property,
     manage_categories,
+    manage_income_categories,
 )
 from gxyfi.dialogs import stop_dca_plan as stop_dca_dialog
 from gxyfi.dca import STOPPED
@@ -56,6 +59,7 @@ from gxyfi.widgets import (
     make_table,
     pnl_color,
     StackedMonths,
+    TrendChart,
     category_colors,
     selected_id,
     set_cell,
@@ -148,7 +152,10 @@ class DashboardPage(Page):
             f"登记月租金 {fmt_cny(summary['rent_monthly'])}",
         )
         self.cards["net"].set_value(fmt_cny(net), " · ".join(missing) if missing else "储蓄 + 投资 + 不动产净值")
-        self.cards["month"].set_value(fmt_cny(summary["month_expense"]), summary["today"][:7])
+        self.cards["month"].set_value(
+            fmt_cny(summary["month_expense"]),
+            f"{summary['today'][:7]} · 本月收入 {fmt_cny(summary['month_income'])}",
+        )
         ratio = "尚未设置预算" if summary["budget_total"] == 0 else f"已用 {fmt_pct(summary['budget_ratio'])}"
         self.cards["budget"].set_value(fmt_cny(summary["budget_total"]), f"已支出 {fmt_cny(summary['year_expense'])} · {ratio}")
         self.mix.set_parts(
@@ -294,10 +301,11 @@ class AccountsPage(Page):
         if word:
             rows = [row for row in rows if word in f"{row['counterparty']} {row['summary']} {row['note']}".lower()]
         fill_txn_table(self.txns, rows)
-        names = {row["id"]: row["name"] for row in db.list_categories()}
+        expense_names = {row["id"]: row["name"] for row in db.list_categories()}
+        income_names = {row["id"]: row["name"] for row in db.list_income_categories()}
         for index, row in enumerate(rows):
-            label = describe_treat(row["treat"], row["category_id"], names)
-            if not label and row["amount"] < 0:
+            label = describe_treat(row["treat"], row["category_id"], expense_names, income_names)
+            if not label and not row["treat"] and row["amount"] != 0:
                 label = "待归类"
             set_cell(self.txns, index, len(TXN_HEADERS), label, color=GOLD if label == "待归类" else None)
         if not account_id:
@@ -435,10 +443,13 @@ class HoldingsPage(Page):
         super().__init__(
             "投资",
             "股票和黄金记在上面。收益率 = 现价 ÷ 成本价 − 1，按原币计算；成本、市值、浮盈按当前汇率折成人民币。当日涨跌看「行情」页。"
+            "卖出时填写卖出价格，盈亏按卖出金额减成本计算，并选择卖出金额是否仍计入总览的投资。"
             "基金定投记在下面：先建计划，再记每一期确认。同一只基金不要在两处各记一份份额。",
         )
         self.add_action("新增持仓", self.add_holding, "primary")
         self.add_action("编辑", self.edit_holding)
+        self.add_action("卖出", self.sell_holding)
+        self.add_action("撤销卖出", self.clear_holding_sale)
         self.add_action("删除", self.delete_holding, "danger")
         self.holding_summary = QLabel("")
         self.holding_summary.setObjectName("TopMeta")
@@ -462,6 +473,8 @@ class HoldingsPage(Page):
             ("编辑计划", self.edit_plan, "ghost"),
             ("停止定投", self.toggle_plan, "ghost"),
             ("删除计划", self.delete_plan, "danger"),
+            ("卖出", self.sell_plan, "ghost"),
+            ("撤销卖出", self.clear_plan_sale, "ghost"),
             ("记一笔", self.add_record, "primary"),
             ("编辑记录", self.edit_record, "ghost"),
             ("删除记录", self.delete_record, "danger"),
@@ -566,7 +579,10 @@ class HoldingsPage(Page):
             set_cell(self.table, index, 5, fmt_price(row["price"]), align="right")
             set_cell(self.table, index, 6, fmt_pct(row["ret"]), align="right", color=pnl_color(pnl_kind(row["ret"])))
             set_cell(self.table, index, 7, fmt_cny(row["cost_cny"]), align="right")
-            set_cell(self.table, index, 8, fmt_cny(row["cny"]), align="right")
+            if row.get("sold") and not row.get("in_invest"):
+                set_cell(self.table, index, 8, f"{fmt_cny(row.get('gross_cny'))} 不计", align="right", color=FLAT)
+            else:
+                set_cell(self.table, index, 8, fmt_cny(row["cny"]), align="right")
             set_cell(self.table, index, 9, fmt_cny(row["pnl_cny"]), align="right", color=pnl_color(pnl_kind(row["pnl_cny"])))
             set_cell(self.table, index, 10, fmt_pct(row["weight"]), align="right")
             source = row["source"] or "—"
@@ -581,6 +597,10 @@ class HoldingsPage(Page):
                 text += f"（{fmt_pct(totals['ret'])}）"
             if totals["without_cost"]:
                 text += f" · {totals['without_cost']} 笔未填成本，不计入收益"
+            if totals["sold_kept"] or totals["sold_out"]:
+                text += f" · 已卖出 {totals['sold_kept']} 笔仍计入、{totals['sold_out']} 笔不计入"
+                if totals["realized_out"] is not None:
+                    text += f"（不计入的盈亏 {fmt_signed(totals['realized_out'])}）"
             self.holding_summary.setText(text)
         else:
             self.holding_summary.setText("")
@@ -599,12 +619,61 @@ class HoldingsPage(Page):
             set_cell(self.plans, index, 5, fmt_price(row["shares"]), align="right")
             set_cell(self.plans, index, 6, fmt_cny(row["cost"]), align="right")
             set_cell(self.plans, index, 7, fmt_price(row["nav"]), align="right")
-            set_cell(self.plans, index, 8, fmt_cny(row["market_value"]), align="right")
+            if row.get("sold") and not row.get("in_invest"):
+                set_cell(self.plans, index, 8, f"{fmt_cny(row.get('proceeds'))} 不计", align="right", color=FLAT)
+            else:
+                set_cell(self.plans, index, 8, fmt_cny(row["market_value"]), align="right")
             set_cell(self.plans, index, 9, fmt_cny(row["pnl"]), align="right", color=pnl_color(pnl_kind(row["pnl"])))
         self.plans.blockSignals(False)
         restore(self.plans, plan_id)
         self._fill_records(record_id)
         self._sync_toggle()
+
+    def sell_holding(self):
+        holding_id = selected_id(self.table)
+        if holding_id is None:
+            QMessageBox.information(self, "未选择", "请先选择一笔持仓。")
+            return
+        current = next((row for row in db.list_holdings() if row["id"] == holding_id), None)
+        if current is None:
+            return
+        cost = None if current["avg_cost"] is None else current["avg_cost"] * current["quantity"]
+        data = edit_sale(self, f"卖出 {current['name']}", current["quantity"], cost, current)
+        if not data:
+            return
+        try:
+            db.sell_holding(holding_id, data)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        self.reload()
+
+    def clear_holding_sale(self):
+        holding_id = selected_id(self.table)
+        if holding_id is None:
+            QMessageBox.information(self, "未选择", "请先选择一笔持仓。")
+            return
+        current = next((row for row in db.list_holdings() if row["id"] == holding_id), None)
+        if current is None or current.get("sell_price") is None:
+            QMessageBox.information(self, "未卖出", "这笔持仓还没有卖出。")
+            return
+        if not self._confirm_clear(f"撤销「{current['name']}」的卖出，恢复成持有？"):
+            return
+        try:
+            db.sell_holding(holding_id, {"sell_price": None})
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        self.reload()
+
+    def _confirm_clear(self, text):
+        box = QMessageBox(self)
+        box.setWindowTitle("撤销卖出")
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.button(QMessageBox.StandardButton.Yes).setText("撤销")
+        box.button(QMessageBox.StandardButton.No).setText("取消")
+        return box.exec() == QMessageBox.StandardButton.Yes
 
     def add_holding(self):
         self._save_dialog()
@@ -665,6 +734,43 @@ class HoldingsPage(Page):
             return
         try:
             db.save_dca_plan(data, plan_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        self.reload()
+
+    def sell_plan(self):
+        plan_id = self._selected_plan()
+        if plan_id is None:
+            return
+        current = next((row for row in db.dca_plan_rows()[0] if row["id"] == plan_id), None)
+        if current is None:
+            return
+        if current["shares"] <= 0:
+            QMessageBox.information(self, "没有份额", "这个计划当前没有可卖出的份额。")
+            return
+        data = edit_sale(self, f"卖出 {current['name']}", current["shares"], current["cost"], current)
+        if not data:
+            return
+        try:
+            db.sell_dca_plan(plan_id, data)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        self.reload()
+
+    def clear_plan_sale(self):
+        plan_id = self._selected_plan()
+        if plan_id is None:
+            return
+        current = next((row for row in db.list_dca_plans() if row["id"] == plan_id), None)
+        if current is None or current.get("sell_price") is None:
+            QMessageBox.information(self, "未卖出", "这个计划还没有卖出。")
+            return
+        if not self._confirm_clear(f"撤销「{current['name']}」的卖出，恢复按净值估值？"):
+            return
+        try:
+            db.sell_dca_plan(plan_id, {"sell_price": None})
         except ValueError as exc:
             QMessageBox.warning(self, "无法保存", str(exc))
             return
@@ -748,6 +854,119 @@ class HoldingsPage(Page):
             QMessageBox.warning(self, "无法保存", str(exc))
             return
         QMessageBox.information(self, "模板已保存", path)
+
+
+class LiquidPage(Page):
+    SPANS = (("week", "周"), ("month", "月"), ("year", "年"), ("decade", "10年"))
+
+    def __init__(self):
+        super().__init__(
+            "非固定资产",
+            "这里只看储蓄和投资，不含不动产。储蓄按每次余额快照结转到每一天；投资从你打开这一页的当天开始逐日记下，之后就能看出市值变化。"
+            "周和月按天画，年按每月最后一天，10 年按每年最后一天。点图上的一个日期，下面列出当天的分项。",
+        )
+        self.span = "month"
+        self._points = []
+        for key, label in self.SPANS:
+            button = self.add_action(label, lambda _checked=False, chosen=key: self._choose(chosen))
+            button.setCheckable(True)
+            if key == "month":
+                self._month_btn = button
+        self.toolbar.addStretch(1)
+        self.cards = {}
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        for index, (key, label) in enumerate((("start", "期初"), ("end", "期末"), ("delta", "变动"))):
+            card = MetricCard(label)
+            self.cards[key] = card
+            grid.addWidget(card, 0, index)
+        self.root.addLayout(grid)
+        panel = Panel("变化")
+        self.chart = TrendChart()
+        self.chart.picked.connect(self._show_parts)
+        panel.body.addWidget(self.chart)
+        self.root.addWidget(panel, 1)
+        self.parts_title = QLabel("分项")
+        self.parts_title.setObjectName("Kicker")
+        self.root.addWidget(self.parts_title)
+        self.parts = make_table(["分项", "类别", "金额", "占当天合计"])
+        self.parts.setMinimumHeight(160)
+        self.root.addWidget(self.parts)
+        self.note = QLabel("")
+        self.note.setObjectName("PageSub")
+        self.note.setWordWrap(True)
+        self.root.addWidget(self.note)
+
+    def _choose(self, span):
+        self.span = span
+        self.reload()
+
+    def reload(self):
+        for index in range(self.toolbar.count()):
+            widget = self.toolbar.itemAt(index).widget()
+            if isinstance(widget, QPushButton) and widget.isCheckable():
+                widget.setChecked(widget.text() == dict(self.SPANS)[self.span])
+        capture_error = ""
+        try:
+            db.capture_liquid_snapshot()
+        except Exception as exc:
+            capture_error = f"今天的投资还没记下来：{exc}"
+        trend = db.liquid_trend(self.span)
+        self._points = trend["points"]
+        self.chart.set_points(self._points)
+        self._fill_ends()
+        self._show_parts(len(self._points) - 1 if self._points else -1)
+        if trend["invest_since"]:
+            note = f"投资从 {trend['invest_since']} 起有每日记录，更早的日期只画储蓄。外币按当前汇率折成人民币。"
+        else:
+            note = "还没有投资的每日记录。打开本页会记下今天的投资，储蓄则按已有余额快照往回画。"
+        if capture_error:
+            note = capture_error + " " + note
+        self.note.setText(note)
+
+    def _fill_ends(self):
+        if not self._points:
+            for card in self.cards.values():
+                card.set_value("—")
+            return
+        start, end = self._points[0], self._points[-1]
+        self.cards["start"].set_value(self._total_text(start), start["day"])
+        self.cards["end"].set_value(self._total_text(end), end["day"])
+        delta = None if start["total"] is None or end["total"] is None else end["total"] - start["total"]
+        savings_delta = end["savings"] - start["savings"]
+        invest_delta = None if start["invest"] is None or end["invest"] is None else end["invest"] - start["invest"]
+        note = f"储蓄 {fmt_signed(savings_delta)}"
+        if invest_delta is not None:
+            note += f" · 投资 {fmt_signed(invest_delta)}"
+        self.cards["delta"].set_value("—" if delta is None else fmt_signed(delta), note)
+
+    def _total_text(self, point):
+        if point["total"] is None:
+            return fmt_cny(point["savings"])
+        return fmt_cny(point["total"])
+
+    def _show_parts(self, index):
+        if index is None or index < 0 or index >= len(self._points):
+            self.parts.setRowCount(0)
+            self.parts_title.setText("分项")
+            return
+        point = self._points[index]
+        title = f"{point['day']} 分项"
+        if point["total"] is None:
+            title += " · 投资尚未记录，合计只含储蓄"
+        else:
+            title += f" · 合计 {fmt_cny(point['total'])}"
+        self.parts_title.setText(title)
+        rows = point["parts"]
+        base = point["total"] if point["total"] not in (None, 0) else point["savings"]
+        self.parts.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            set_cell(self.parts, row_index, 0, row["name"])
+            set_cell(self.parts, row_index, 1, row["group"])
+            set_cell(self.parts, row_index, 2, fmt_cny(row["amount"]), align="right")
+            share = None if not base else row["amount"] / base
+            set_cell(self.parts, row_index, 3, fmt_pct(share), align="right")
 
 
 class PropertyPage(Page):
@@ -1035,6 +1254,222 @@ class ExpensesPage(Page):
 
     def open_categories(self):
         if manage_categories(self):
+            self.reload()
+
+
+class IncomesPage(Page):
+    def __init__(self):
+        super().__init__(
+            "收入",
+            "收入按人民币登记。可以手工记，也可以把导入的账户明细归类成收入。"
+            "点「分类构成」里的一类只看这一类，点右边的柱子切换到那个月。"
+            "「类别」里可以停用类别，并把过去的收入调整到新类别。退款请在支出里冲减，不要记成收入。",
+        )
+        self.category_filter = None
+        self.period_box = QComboBox()
+        self.period_box.setMinimumWidth(130)
+        today = date.today()
+        self.period_box.addItem("全部月份", None)
+        for year in (today.year, today.year - 1):
+            self.period_box.addItem(f"{year} 全年", f"{year:04d}")
+        for year, month in reversed(db.recent_months(24)):
+            key = f"{year:04d}-{month:02d}"
+            self.period_box.addItem(f"{year} 年 {month} 月", key)
+        self.period_box.setCurrentIndex(max(self.period_box.findData(today.strftime("%Y-%m")), 0))
+        self.period_box.currentIndexChanged.connect(self._period_changed)
+        self.toolbar.addWidget(self.period_box)
+        self.add_action("记一笔", self.add_income, "primary")
+        self.add_action("编辑", self.edit_income)
+        self.add_action("删除", self.delete_income, "danger")
+        self.add_action("类别", self.open_categories)
+        self.toolbar.addSpacing(18)
+        self.classify_btn = self.add_action("归类明细", self.open_classify, "primary")
+        self.toolbar.addStretch(1)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        self.cards = {}
+        for key, label in (("total", "本期收入"), ("change", "比上期"), ("top", "最多的一类"), ("count", "笔数")):
+            card = MetricCard(label)
+            card.setMinimumHeight(96)
+            self.cards[key] = card
+            cards.addWidget(card, 1)
+        self.root.addLayout(cards)
+
+        charts = QHBoxLayout()
+        charts.setSpacing(12)
+        mix = Panel("分类构成")
+        self.category_bars = CategoryBars()
+        self.category_bars.picked.connect(self._category_picked)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.setWidget(self.category_bars)
+        mix.body.addWidget(scroll)
+        trend = Panel("近六个月 · 按类别")
+        self.months = StackedMonths()
+        self.months.picked.connect(self._month_picked)
+        trend.body.addWidget(self.months)
+        for panel in (mix, trend):
+            panel.setFixedHeight(270)
+        charts.addWidget(mix, 5)
+        charts.addWidget(trend, 4)
+        self.root.addLayout(charts)
+
+        filter_bar = QHBoxLayout()
+        self.filter_label = QLabel("")
+        self.filter_label.setObjectName("Figure")
+        self.clear_filter = QPushButton("显示全部类别")
+        self.clear_filter.setObjectName("GhostButton")
+        self.clear_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_filter.clicked.connect(lambda: self._category_picked(None))
+        filter_bar.addWidget(self.filter_label)
+        filter_bar.addWidget(self.clear_filter)
+        filter_bar.addStretch(1)
+        self.root.addLayout(filter_bar)
+
+        self.table = make_table(["日期", "类别", "金额", "对象", "来源", "备注"])
+        self.table.setMinimumHeight(180)
+        self.table.cellDoubleClicked.connect(lambda *_: self.edit_income())
+        self.root.addWidget(self.table, 1)
+
+    def _period(self):
+        return self.period_box.currentData()
+
+    def _period_changed(self, *_args):
+        self.category_filter = None
+        self.reload()
+
+    def _category_picked(self, category_id):
+        self.category_filter = category_id
+        self.reload()
+
+    def _month_picked(self, key):
+        index = self.period_box.findData(key)
+        if index >= 0 and index != self.period_box.currentIndex():
+            self.period_box.setCurrentIndex(index)
+
+    @staticmethod
+    def _days(period):
+        today = date.today()
+        if not period:
+            return None
+        if len(period) == 4:
+            year = int(period)
+            end = today if year == today.year else date(year, 12, 31)
+            return (end - date(year, 1, 1)).days + 1
+        year, month = int(period[:4]), int(period[5:7])
+        if (year, month) == (today.year, today.month):
+            return today.day
+        nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        return (nxt - date(year, month, 1)).days
+
+    def reload(self):
+        current = selected_id(self.table)
+        period = self._period()
+        incomes = db.list_incomes()
+        categories = db.list_income_categories()
+        colors = category_colors([row["name"] for row in categories])
+        groups = spending.by_category(incomes, period)
+        if self.category_filter not in {row["category_id"] for row in groups}:
+            self.category_filter = None
+        self.category_bars.set_rows(groups, colors, {}, self.category_filter)
+        keys, names, cells = spending.monthly_stack(incomes, 6)
+        self.months.set_data(keys, names, cells, colors, period if period and len(period) == 7 else None)
+        self._fill_cards(incomes, groups, period)
+
+        rows = [row for row in incomes if spending.in_period(row, period)]
+        if self.category_filter is not None:
+            rows = [row for row in rows if row["category_id"] == self.category_filter]
+            name = next(row["category"] for row in groups if row["category_id"] == self.category_filter)
+            self.filter_label.setText(f"只看「{name}」 · {len(rows)} 笔 · 合计 {fmt_cny(sum(row['amount'] for row in rows))}")
+            self.clear_filter.setVisible(True)
+        else:
+            self.filter_label.setText(f"{spending.period_label(period)} · {len(rows)} 笔明细")
+            self.clear_filter.setVisible(False)
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            set_cell(self.table, index, 0, row["occurred_on"], row["id"])
+            set_cell(self.table, index, 1, row["category"], color=colors.get(row["category"]))
+            set_cell(self.table, index, 2, fmt_cny(row["amount"]), align="right")
+            set_cell(self.table, index, 3, row["payee"])
+            set_cell(self.table, index, 4, self._source(row), color=GOLD if row.get("txn_id") else None)
+            set_cell(self.table, index, 5, row["note"])
+        restore(self.table, current)
+        waiting = db.pending_count()
+        self.classify_btn.setText(f"归类明细（{waiting} 笔待归类）" if waiting else "归类明细")
+
+    def _fill_cards(self, incomes, groups, period):
+        amount = spending.total(incomes, period)
+        count = sum(row["count"] for row in groups)
+        days = self._days(period)
+        note = f"{count} 笔" + (f" · 日均 {fmt_cny(amount / days)}" if days else "")
+        self.cards["total"].set_value(fmt_cny(amount), note)
+        self.cards["count"].set_value(str(count), spending.period_label(period))
+
+        before = spending.previous_period(period)
+        if before is None:
+            self.cards["change"].set_value("—", "选一个月或一年才能和上期比较")
+        else:
+            last = spending.total(incomes, before)
+            if last:
+                change = (amount - last) / last
+                self.cards["change"].set_value(f"{'+' if change > 0 else ''}{change * 100:.1f}%", f"{spending.period_label(before)} {fmt_cny(last)}")
+            else:
+                self.cards["change"].set_value("—", f"{spending.period_label(before)} 没有收入")
+
+        top = groups[0] if groups and groups[0]["amount"] > 0 else None
+        if top:
+            self.cards["top"].set_value(top["category"], f"{fmt_cny(top['amount'])} · 占 {top['share'] * 100:.0f}%")
+        else:
+            self.cards["top"].set_value("—", "")
+
+    @staticmethod
+    def _source(row):
+        if not row.get("txn_id"):
+            return "手工"
+        if (row.get("source") or "手工") == "手工":
+            return "手工 · 已对上明细"
+        return "明细"
+
+    def open_classify(self):
+        from gxyfi.classify_ui import open_classify
+
+        if open_classify(self):
+            self.reload()
+
+    def add_income(self):
+        data = edit_income(self, db.choosable_income_categories())
+        if data:
+            db.save_income(data)
+            self.reload()
+
+    def edit_income(self):
+        income_id = selected_id(self.table)
+        if income_id is None:
+            QMessageBox.information(self, "未选择", "请先选择一笔收入。")
+            return
+        initial = next((row for row in db.list_incomes() if row["id"] == income_id), None)
+        data = edit_income(self, db.choosable_income_categories(initial["category_id"]), initial)
+        if data:
+            db.save_income(data, income_id)
+            self.reload()
+
+    def delete_income(self):
+        income_id = selected_id(self.table)
+        if income_id is None:
+            QMessageBox.information(self, "未选择", "请先选择一笔收入。")
+            return
+        linked = next((row for row in db.list_incomes() if row["id"] == income_id), {}).get("txn_id")
+        text = "删除这笔收入？" + ("\n它对应的那笔明细会标成「不算」，明细本身不删。" if linked else "")
+        if confirm(self, text):
+            db.delete_income(income_id)
+            self.reload()
+
+    def open_categories(self):
+        if manage_income_categories(self):
             self.reload()
 
 

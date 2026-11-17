@@ -1,4 +1,4 @@
-"""「归类明细」窗口：把导入的明细确认成支出、退款或不算支出。"""
+"""「归类明细」窗口：把导入的明细确认成支出、退款、收入或不计。"""
 
 from __future__ import annotations
 
@@ -56,6 +56,8 @@ class ClassifyDialog(QDialog):
         self.changed = False
         self.rows = []
         self.suggestions = {}
+        self.expense_names = {}
+        self.income_names = {}
         self.transfers = auto_transfers()
         if self.transfers:
             self.changed = True
@@ -63,12 +65,12 @@ class ClassifyDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 18)
         layout.setSpacing(10)
-        title = QLabel("把明细归到支出")
+        title = QLabel("把明细归到支出或收入")
         title.setObjectName("DialogTitle")
         layout.addWidget(title)
         layout.addWidget(_label(
-            "这里列出导入的明细里还没归类的支出，以及看起来像退款的收入。程序先给出建议，你确认后才计入「支出」和预算。"
-            "可以按住 Ctrl 或 Shift 多选，一次归一类。"
+            "这里列出导入后还没归类的支出和收入。程序先给出建议，你确认后才计入「支出」或「收入」。"
+            "退款会冲减对应支出类别；工资等正流水请归为收入。可以按住 Ctrl 或 Shift 多选。"
         ))
         self.summary = _label("", "Figure")
         layout.addWidget(self.summary)
@@ -105,15 +107,23 @@ class ClassifyDialog(QDialog):
         self.confirm_btn.clicked.connect(self.accept_selected)
         actions.addWidget(self.confirm_btn)
         actions.addSpacing(12)
-        actions.addWidget(QLabel("归为"))
-        self.category = QComboBox()
-        self.category.setMinimumWidth(120)
-        actions.addWidget(self.category)
-        put = _button("归入这一类", "primary")
-        put.clicked.connect(self.put_category)
-        actions.addWidget(put)
-        skip = _button("不算支出")
-        skip.setToolTip("转账给别人以外的资金往来，比如还信用卡、买理财、存定期")
+        actions.addWidget(QLabel("支出类"))
+        self.expense_category = QComboBox()
+        self.expense_category.setMinimumWidth(110)
+        actions.addWidget(self.expense_category)
+        put_expense = _button("归入支出/退款", "primary")
+        put_expense.clicked.connect(self.put_expense)
+        actions.addWidget(put_expense)
+        actions.addSpacing(8)
+        actions.addWidget(QLabel("收入类"))
+        self.income_category = QComboBox()
+        self.income_category.setMinimumWidth(110)
+        actions.addWidget(self.income_category)
+        put_income = _button("归为收入", "primary")
+        put_income.clicked.connect(self.put_income)
+        actions.addWidget(put_income)
+        skip = _button("不算")
+        skip.setToolTip("转账给别人以外的资金往来，比如还信用卡、买理财、存定期；不算支出也不算收入")
         skip.clicked.connect(self.mark_skip)
         actions.addWidget(skip)
         self.reset_btn = _button("恢复待归类", "danger")
@@ -131,15 +141,24 @@ class ClassifyDialog(QDialog):
         self.reload()
 
     def reload(self):
-        categories = db.list_categories()
-        self.names = {row["id"]: row["name"] for row in categories}
-        current = self.category.currentData()
-        self.category.clear()
-        for row in categories:
+        expense_categories = db.list_categories()
+        income_categories = db.list_income_categories()
+        self.expense_names = {row["id"]: row["name"] for row in expense_categories}
+        self.income_names = {row["id"]: row["name"] for row in income_categories}
+        current_expense = self.expense_category.currentData()
+        current_income = self.income_category.currentData()
+        self.expense_category.clear()
+        self.income_category.clear()
+        for row in expense_categories:
             if row.get("active", 1):
-                self.category.addItem(row["name"], row["id"])
-        if current is not None:
-            self.category.setCurrentIndex(max(self.category.findData(current), 0))
+                self.expense_category.addItem(row["name"], row["id"])
+        for row in income_categories:
+            if row.get("active", 1):
+                self.income_category.addItem(row["name"], row["id"])
+        if current_expense is not None:
+            self.expense_category.setCurrentIndex(max(self.expense_category.findData(current_expense), 0))
+        if current_income is not None:
+            self.income_category.setCurrentIndex(max(self.income_category.findData(current_income), 0))
         rules = db.list_rules()
         everything = db._all(
             """
@@ -148,8 +167,11 @@ class ClassifyDialog(QDialog):
             """
         )
         pending_rows = classify.pending([row for row in everything if not row["treat"]], rules)
-        history = [row for row in everything if row["treat"] in ("支出", "退款")]
-        self.suggestions = classify.suggest(pending_rows, rules, db.list_expenses(), categories, history)
+        history = [row for row in everything if row["treat"] in ("支出", "退款", "收入")]
+        self.suggestions = classify.suggest(
+            pending_rows, rules, db.list_expenses(), expense_categories, history,
+            db.list_incomes(), income_categories,
+        )
         done_view = self.view.currentData() == VIEW_DONE
         if done_view:
             self.rows = [row for row in everything if row["treat"]]
@@ -172,8 +194,11 @@ class ClassifyDialog(QDialog):
         self._fill()
 
     def edit_rules(self):
-        RulesDialog(self.names, self).exec()
+        RulesDialog(self.expense_names, self.income_names, self).exec()
         self.reload()
+
+    def _describe(self, treat, category_id):
+        return classify.describe(treat, category_id, self.expense_names, self.income_names)
 
     def _fill(self):
         word = self.search.text().strip().lower()
@@ -188,15 +213,16 @@ class ClassifyDialog(QDialog):
             set_cell(self.table, index, 4, fmt_money(-amount) if amount < 0 else "", align="right", color=UP)
             set_cell(self.table, index, 5, fmt_money(amount) if amount > 0 else "", align="right", color=DOWN)
             if row["treat"]:
-                set_cell(self.table, index, 6, classify.describe(row["treat"], row["category_id"], self.names))
+                set_cell(self.table, index, 6, self._describe(row["treat"], row["category_id"]))
                 set_cell(self.table, index, 7, "")
                 continue
             hint = self.suggestions.get(row["id"])
             if hint is None:
-                set_cell(self.table, index, 6, "请选择" if amount < 0 else "退款？请选择类别", color=MUTED)
+                hint_text = "请选择支出类" if amount < 0 else "请选择收入类，或归为退款"
+                set_cell(self.table, index, 6, hint_text, color=MUTED)
                 set_cell(self.table, index, 7, "")
             else:
-                text = "合并到手工记录" if hint["merge"] else classify.describe(hint["treat"], hint["category_id"], self.names)
+                text = "合并到手工记录" if hint["merge"] else self._describe(hint["treat"], hint["category_id"])
                 set_cell(self.table, index, 6, text, color=UP if hint["merge"] else GOLD)
                 set_cell(self.table, index, 7, hint["reason"], color=MUTED)
 
@@ -213,13 +239,19 @@ class ClassifyDialog(QDialog):
         return rows
 
     def _apply(self, pairs):
-        """pairs: [(明细, 归类)]，归类含 treat、category_id、expense_id。"""
+        """pairs: [(明细, 归类)]，归类含 treat、category_id、expense_id、income_id。"""
         if not pairs:
             return
         items, rules = [], []
         for txn, choice in pairs:
-            items.append({"id": txn["id"], "treat": choice["treat"], "category_id": choice.get("category_id"), "expense_id": choice.get("expense_id")})
-            if self.learn.isChecked() and not choice.get("expense_id"):
+            items.append({
+                "id": txn["id"],
+                "treat": choice["treat"],
+                "category_id": choice.get("category_id"),
+                "expense_id": choice.get("expense_id"),
+                "income_id": choice.get("income_id"),
+            })
+            if self.learn.isChecked() and not choice.get("expense_id") and not choice.get("income_id"):
                 rule = classify.rule_for(txn, choice["treat"], choice.get("category_id"))
                 if rule and all(existing["keyword"] != rule["keyword"] or existing["field"] != rule["field"] for existing in rules):
                     rules.append(rule)
@@ -251,14 +283,32 @@ class ClassifyDialog(QDialog):
         missing = len(rows) - len(pairs)
         self._apply(pairs)
         if missing:
-            QMessageBox.information(self, "还有没建议的", f"有 {missing} 笔没有建议，请在下面选一个类别后点「归入这一类」，或点「不算支出」。")
+            QMessageBox.information(
+                self, "还有没建议的",
+                f"有 {missing} 笔没有建议，请选支出类点「归入支出/退款」，或选收入类点「归为收入」，或点「不算」。",
+            )
 
-    def put_category(self):
+    def put_expense(self):
         rows = self._selected()
-        category_id = self.category.currentData()
+        category_id = self.expense_category.currentData()
         if not rows or category_id is None:
             return
+        bad = [row for row in rows if row["amount"] == 0]
+        if bad:
+            QMessageBox.information(self, "无法归类", "金额为 0 的明细不能归为支出或退款。")
+            return
         self._apply([(row, {"treat": "支出" if row["amount"] < 0 else "退款", "category_id": category_id}) for row in rows])
+
+    def put_income(self):
+        rows = self._selected()
+        category_id = self.income_category.currentData()
+        if not rows or category_id is None:
+            return
+        bad = [row for row in rows if row["amount"] <= 0]
+        if bad:
+            QMessageBox.information(self, "无法归类", "只有收入明细（金额为正）才能归为收入。支出请用「归入支出/退款」。")
+            return
+        self._apply([(row, {"treat": "收入", "category_id": category_id}) for row in rows])
 
     def mark_skip(self):
         rows = self._selected()
@@ -275,12 +325,13 @@ class ClassifyDialog(QDialog):
 class RulesDialog(QDialog):
     FIELDS = {"counterparty": "对方户名", "summary": "摘要"}
 
-    def __init__(self, names, parent=None):
+    def __init__(self, expense_names, income_names, parent=None):
         super().__init__(parent)
         self.setWindowTitle("已记住的规则")
         self.setModal(True)
         self.resize(640, 480)
-        self.names = names
+        self.expense_names = expense_names
+        self.income_names = income_names
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 18)
         layout.setSpacing(10)
@@ -311,7 +362,10 @@ class RulesDialog(QDialog):
         for index, rule in enumerate(rules):
             set_cell(self.table, index, 0, self.FIELDS.get(rule["field"], rule["field"]), rule["id"])
             set_cell(self.table, index, 1, rule["keyword"])
-            set_cell(self.table, index, 2, classify.describe(rule["treat"], rule["category_id"], self.names))
+            set_cell(
+                self.table, index, 2,
+                classify.describe(rule["treat"], rule["category_id"], self.expense_names, self.income_names),
+            )
 
     def remove(self):
         ids = [self.table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole) for index in self.table.selectionModel().selectedRows()]

@@ -36,8 +36,11 @@ class ClassifyTest(unittest.TestCase):
         everything = db._all("SELECT * FROM account_txns")
         rules = db.list_rules()
         rows = classify.pending([row for row in everything if not row["treat"]], rules)
-        history = [row for row in everything if row["treat"] in ("支出", "退款")]
-        return rows, classify.suggest(rows, rules, db.list_expenses(), db.list_categories(), history)
+        history = [row for row in everything if row["treat"] in ("支出", "退款", "收入")]
+        return rows, classify.suggest(
+            rows, rules, db.list_expenses(), db.list_categories(), history,
+            db.list_incomes(), db.list_income_categories(),
+        )
 
     def test_flow(self):
         db.import_txns(self.card, [
@@ -61,17 +64,33 @@ class ClassifyTest(unittest.TestCase):
 
         rows, hints = self.suggestions()
         by_party = {(row["counterparty"] or row["summary"]): hints.get(row["id"]) for row in rows}
-        self.assertNotIn("公司", by_party)
+        self.assertEqual(by_party["公司"]["treat"], "收入")
         self.assertEqual(by_party["美团"]["category_id"], self.cat["餐饮"])
         self.assertEqual(by_party["信用卡还款"]["treat"], "不计")
         self.assertTrue(by_party["老王面馆"]["merge"])
         self.assertIsNone(by_party["某某公司"])
-        refund = next(row for row in rows if row["amount"] > 0)
+        refund = next(row for row in rows if row["amount"] > 0 and row["counterparty"] == "美团")
         self.assertEqual(hints[refund["id"]]["treat"], "退款")
 
-        items = [{"id": row["id"], **{key: hints[row["id"]][key] for key in ("treat", "category_id", "expense_id")}} for row in rows if row["id"] in hints]
+        income_cat = {row["name"]: row["id"] for row in db.list_income_categories()}
+        items = []
+        for row in rows:
+            if row["id"] not in hints:
+                continue
+            hint = hints[row["id"]]
+            items.append({
+                "id": row["id"],
+                "treat": hint["treat"],
+                "category_id": hint.get("category_id"),
+                "expense_id": hint.get("expense_id"),
+                "income_id": hint.get("income_id"),
+            })
         other = next(row for row in rows if row["counterparty"] == "某某公司")
         items.append({"id": other["id"], "treat": "支出", "category_id": self.cat["日用"]})
+        salary = next(row for row in rows if row["counterparty"] == "公司")
+        if salary["id"] not in hints or hints[salary["id"]].get("category_id") is None:
+            items = [item for item in items if item["id"] != salary["id"]]
+            items.append({"id": salary["id"], "treat": "收入", "category_id": income_cat["工资"]})
         db.classify_txns(items, [classify.rule_for(other, "支出", self.cat["日用"])])
 
         expenses = db.list_expenses()
@@ -82,6 +101,10 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(sorted(round(row["amount"], 2) for row in expenses), [-20, 35, 88, 120])
         food = next(row for row in db.budget_progress(2026) if row["category"] == "餐饮")
         self.assertEqual(food["actual"], 103)
+        incomes = db.list_incomes()
+        self.assertEqual(len(incomes), 1)
+        self.assertEqual(incomes[0]["amount"], 9000)
+        self.assertEqual(incomes[0]["category"], "工资")
         self.assertEqual(db.pending_count(), 0)
 
         db.import_txns(self.card, [txn("2026-10-20", -60, "某某公司", "消费")], None, "c")

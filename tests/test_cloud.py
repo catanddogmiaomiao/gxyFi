@@ -12,6 +12,8 @@ KEYS = {
     "property": "properties",
     "category": "categories",
     "expense": "expenses",
+    "income_category": "incomeCategories",
+    "income": "incomes",
     "budget": "budgets",
     "dca_plan": "dcaPlans",
     "dca_record": "dcaRecords",
@@ -23,12 +25,14 @@ class FakeSite:
 
     def __init__(self):
         self.state = {key: [] for key in KEYS.values()}
-        self.state.update(quotes=[], fx=[])
+        self.state.update(quotes=[], fx=[], txnRules=[])
         self.next_id = 100
         self.calls = []
         self.token_ok = True
         for name in ("餐饮", "居住"):
-            self._insert("categories", {"name": name, "sort_order": 0})
+            self._insert("categories", {"name": name, "sort_order": 0, "active": 1})
+        for name in ("工资", "奖金"):
+            self._insert("incomeCategories", {"name": name, "sort_order": 0, "active": 1})
 
     def _insert(self, key, data):
         self.next_id += 1

@@ -286,6 +286,14 @@ def delete_holding(holding_id):
     mutate("holding", "delete", record_id=holding_id)
 
 
+def sell_holding(holding_id, data):
+    mutate("holding_sale", "update", data, holding_id)
+
+
+def clear_holding_sale(holding_id):
+    mutate("holding_sale", "update", {"sell_price": None}, holding_id)
+
+
 PLAN_KEYS = ("name", "symbol", "amount", "cycle", "debit_day", "status", "started_on", "manual_nav", "note", "stopped_on", "stop_reason")
 RECORD_KEYS = ("plan_id", "kind", "trade_date", "amount", "nav", "shares", "fee", "note")
 
@@ -301,6 +309,18 @@ def delete_dca_plan(plan_id):
 
 def set_dca_status(plan_id, status, stopped_on=None, reason=""):
     mutate("dca_plan_status", "update", {"status": status, "stopped_on": stopped_on, "stop_reason": reason}, plan_id)
+
+
+def sell_dca_plan(plan_id, data):
+    mutate("dca_sale", "update", data, plan_id)
+
+
+def clear_dca_sale(plan_id):
+    mutate("dca_sale", "update", {"sell_price": None}, plan_id)
+
+
+def save_liquid_day(data):
+    mutate("liquid_day", "upsert", data)
 
 
 def save_dca_record(data, record_id=None):
@@ -375,6 +395,29 @@ def save_expense(data, expense_id=None):
 
 def delete_expense(expense_id):
     mutate("expense", "delete", record_id=expense_id)
+
+
+def save_income_category(name, category_id=None):
+    if category_id:
+        return mutate("income_category", "update", {"name": name}, category_id, "income_categories")
+    return mutate("income_category", "create", {"name": name}, None, "income_categories")
+
+
+def set_income_category_active(category_id, active):
+    mutate("income_category", "update", {"active": 1 if active else 0}, category_id, "income_categories")
+
+
+def move_income_category(source_id, target_id):
+    mutate("income_category_move", "update", {"target_id": int(target_id)}, source_id)
+
+
+def save_income(data, income_id=None):
+    payload = {key: data.get(key) for key in ("category_id", "occurred_on", "amount", "payee", "note")}
+    return mutate("income", _op(income_id), payload, income_id, "incomes")
+
+
+def delete_income(income_id):
+    mutate("income", "delete", record_id=income_id)
 
 
 def save_budget(year, category_id, amount, note=""):
@@ -532,6 +575,17 @@ def local_only(local, remote):
         if key not in cloud_expenses:
             add("expense", "支出", f"{row['occurred_on']}  {key[2]}  {_money(row['amount'])}  {row['payee']}".strip(), row)
 
+    local_income_categories = {row["id"]: row["name"] for row in local.get("incomeCategories") or []}
+    cloud_income_categories = {row["id"]: row["name"] for row in remote.get("incomeCategories") or []}
+    cloud_incomes = {
+        (row["occurred_on"], round(float(row["amount"]), 2), cloud_income_categories.get(row["category_id"]), row["payee"])
+        for row in remote.get("incomes") or []
+    }
+    for row in local.get("incomes") or []:
+        key = (row["occurred_on"], round(float(row["amount"]), 2), local_income_categories.get(row["category_id"]), row["payee"])
+        if key not in cloud_incomes:
+            add("income", "收入", f"{row['occurred_on']}  {key[2]}  {_money(row['amount'])}  {row['payee']}".strip(), row)
+
     cloud_budgets = {(row["year"], cloud_categories.get(row["category_id"])) for row in remote.get("budgets") or []}
     for row in local["budgets"]:
         name = local_categories.get(row["category_id"])
@@ -565,7 +619,7 @@ def local_only(local, remote):
     return items, matches
 
 
-UPLOAD_ORDER = ("account", "balance", "property", "holding", "expense", "budget", "dca_plan", "dca_record", "txns")
+UPLOAD_ORDER = ("account", "balance", "property", "holding", "expense", "income", "budget", "dca_plan", "dca_record", "txns")
 
 
 def upload(selected, local, matches):
@@ -603,6 +657,13 @@ def upload(selected, local, matches):
                 if target is None:
                     continue
                 save_expense({**row, "category_id": target})
+            elif kind == "income":
+                name = {item["id"]: item["name"] for item in local.get("incomeCategories") or []}.get(row["category_id"])
+                if not name:
+                    continue
+                found = db._one("SELECT id FROM income_categories WHERE name=?", (name,))
+                target = found["id"] if found else save_income_category(name)
+                save_income({**row, "category_id": target})
             elif kind == "budget":
                 target = category_id(row["category_id"])
                 if target is None:
